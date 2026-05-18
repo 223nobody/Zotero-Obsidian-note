@@ -1,0 +1,7 @@
+interface:
+  display_name: "Zotero Group Meeting Note"
+  short_description: "Reviewed Chinese seminar notes"
+  default_prompt: "Use $zotero-group-meeting-note to turn the active Zotero paper into a Chinese group-meeting note with detailed innovation, source-ordered figure/table/formula sections, conclusion-data, and related-work explanations, then run a review pass that checks evidence coverage, terminology consistency, and inline Chinese translations for recurring technical English phrases before saving it to ~/Documents/Obsidian Vault/组会分享/<yy-M-d>/<paper title>.md unless I specify another path or filename."
+
+policy:
+  allow_implicit_invocation: true
