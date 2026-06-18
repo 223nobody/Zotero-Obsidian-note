@@ -1,0 +1,7 @@
+interface:
+  display_name: "Zotero Group Meeting Note"
+  short_description: "MCP-aware Chinese seminar notes"
+  default_prompt: "Use $zotero-group-meeting-note to turn the active Zotero paper or paper-search-mcp parsed source pack into a Chinese group-meeting note with a source-ordered mixed evidence timeline, matched images placed beside their Figure/Table/Equation/Prompt entries, no MinerU asset index, terminology review, and final saving to ~/Documents/Obsidian Vault/组会分享/<yy-M-d>/<paper title>.md unless I specify another path or filename."
+
+policy:
+  allow_implicit_invocation: true
