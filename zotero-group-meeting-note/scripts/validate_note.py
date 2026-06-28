@@ -74,6 +74,15 @@ def parse_args() -> argparse.Namespace:
         help="Treat evidence placement warnings as validation errors.",
     )
     parser.add_argument(
+        "--blueprint",
+        help="Optional references/blueprint.md path used as the structure contract.",
+    )
+    parser.add_argument(
+        "--strict-assets",
+        action="store_true",
+        help="Treat non-assets relative image links and remote images as validation errors.",
+    )
+    parser.add_argument(
         "--copy-map-authoritative",
         action="store_true",
         help="When --copy-map is provided, accept only copy-map destination/hash/markdown links for evidence assets.",
@@ -531,6 +540,139 @@ def check_image_links(
     return errors, warnings, image_count
 
 
+def normalize_heading_text(value: str) -> str:
+    cleaned = re.sub(r"<[^>]+>", "", value)
+    cleaned = re.sub(r"[：:]\s*$", "", cleaned.strip())
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def heading_level(line: str) -> int:
+    match = re.match(r"^\s{0,3}(#{1,6})\s+", line)
+    return len(match.group(1)) if match else 0
+
+
+def extract_blueprint_headings(blueprint_path: Path) -> list[str]:
+    text = blueprint_path.read_text(encoding="utf-8", errors="ignore")
+    code_blocks = re.findall(r"```markdown\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    candidates: list[str] = []
+    for block in code_blocks:
+        block_headings = [
+            normalize_heading_text(line.lstrip("#").strip())
+            for line in block.splitlines()
+            if line.startswith("#") and heading_level(line) <= 2
+        ]
+        if len(block_headings) > len(candidates):
+            candidates = block_headings
+    if candidates:
+        return candidates
+    return [
+        normalize_heading_text(match.group("title"))
+        for match in HEADING_RE.finditer(text)
+        if text[match.start() : match.start() + 3].startswith("## ")
+    ]
+
+
+def note_top_headings(note_text: str) -> list[dict[str, Any]]:
+    headings = []
+    for match in HEADING_RE.finditer(note_text):
+        raw_line = match.group(0)
+        level = heading_level(raw_line)
+        if level <= 2:
+            headings.append(
+                {
+                    "title": normalize_heading_text(match.group("title")),
+                    "line": note_text.count("\n", 0, match.start()) + 1,
+                    "level": level,
+                }
+            )
+    return headings
+
+
+def heading_matches(actual: str, expected: str) -> bool:
+    if not expected:
+        return True
+    if "<" in expected and ">" in expected:
+        prefix = expected.split("<", 1)[0].strip()
+        return not prefix or actual.startswith(prefix)
+    return actual == expected or actual.startswith(expected + ":") or actual.startswith(expected + "：")
+
+
+def is_optional_blueprint_heading(expected: str) -> bool:
+    lowered = expected.lower()
+    return any(
+        token in lowered
+        for token in (
+            "appendix",
+            "supplement",
+            "post-reference",
+            "references",
+            "参考",
+            "补充",
+            "附录",
+            "鍙傝",
+            "琛ュ厖",
+            "闄勫綍",
+        )
+    )
+
+
+def check_blueprint_structure(note_text: str, blueprint_path: Path) -> list[dict[str, str | int]]:
+    errors: list[dict[str, str | int]] = []
+    if not blueprint_path.is_file():
+        return [
+            {
+                "kind": "blueprint_not_found",
+                "line": 0,
+                "message": f"Blueprint file not found: {blueprint_path}",
+            }
+        ]
+
+    expected = extract_blueprint_headings(blueprint_path)
+    if not expected:
+        return [
+            {
+                "kind": "blueprint_structure_unreadable",
+                "line": 0,
+                "message": f"No Markdown structure block or top headings could be read from: {blueprint_path}",
+            }
+        ]
+    actual_headings = note_top_headings(note_text)
+    actual_titles = [heading["title"] for heading in actual_headings]
+    actual_index = 0
+
+    for expected_title in expected:
+        if not expected_title:
+            continue
+        found_index = None
+        for index in range(actual_index, len(actual_titles)):
+            if heading_matches(actual_titles[index], expected_title):
+                found_index = index
+                break
+        if found_index is None:
+            if is_optional_blueprint_heading(expected_title):
+                continue
+            errors.append(
+                {
+                    "kind": "missing_blueprint_heading",
+                    "line": 0,
+                    "message": f"Expected blueprint heading not found in order: {expected_title}",
+                }
+            )
+        else:
+            actual_index = found_index + 1
+
+    if actual_headings and actual_headings[0]["level"] != 1:
+        errors.append(
+            {
+                "kind": "missing_top_level_title",
+                "line": int(actual_headings[0]["line"]),
+                "message": "The first top-level heading should be an H1 note title.",
+            }
+        )
+    return errors
+
+
 def check_evidence_coverage(
     note_path: Path,
     note_text: str,
@@ -546,16 +688,69 @@ def check_evidence_coverage(
     copy_map = read_json(copy_map_path) if copy_map_path and copy_map_path.is_file() else None
     items = iter_manifest_items(manifest)
     images = image_records(note_path, note_text)
+    ordered_windows: list[dict[str, Any]] = []
 
     for item in items:
-        if item.get("match_confidence") != "high":
+        label = item.get("label", "")
+        if not label:
             continue
-        expected_assets = expected_assets_for_item(
-            item,
-            copy_map,
-            copy_map_authoritative,
-            allow_basename_fallback=not strict_identity,
-        )
+        required = bool(item.get("required_in_final"))
+        high_confidence = item.get("match_confidence") == "high"
+        expected_assets = []
+        if high_confidence:
+            expected_assets = expected_assets_for_item(
+                item,
+                copy_map,
+                copy_map_authoritative,
+                allow_basename_fallback=not strict_identity,
+            )
+        should_check_presence = required or high_confidence
+        if not should_check_presence:
+            continue
+
+        window = evidence_window(note_text, str(label))
+        if window is None:
+            region = item.get("region", "main")
+            if qa_rows is not None:
+                qa_rows.append(
+                    {
+                        "item_key": item.get("item_key", ""),
+                        "label": label,
+                        "region": region,
+                        "section": item.get("section", ""),
+                        "manifest_block_index": item.get("block_index", ""),
+                        "expected_assets": expected_assets,
+                        "local_images": [],
+                        "status": "missing_required_evidence"
+                        if required
+                        else "missing_evidence_reference",
+                    }
+                )
+            warnings.append(
+                {
+                    "kind": "missing_required_evidence"
+                    if required
+                    else "missing_evidence_reference",
+                    "line": 0,
+                    "message": (
+                        f"Required evidence item '{label}' ({region}) is not referenced in the note body."
+                        if required
+                        else f"High-confidence evidence item '{label}' ({region}) with matched asset is not referenced in the note body. Section: {item.get('section', 'unknown')}"
+                    ),
+                }
+            )
+            continue
+
+        if item.get("region") == "main":
+            ordered_windows.append(
+                {
+                    "label": label,
+                    "order": int(item.get("order", 0) or 0),
+                    "start": int(window["start"]),
+                    "line": int(window["line"]),
+                }
+            )
+
         if copy_map_authoritative and copy_map is not None and not expected_assets:
             region = item.get("region", "main")
             if qa_rows is not None:
@@ -584,37 +779,6 @@ def check_evidence_coverage(
             continue
         if not expected_assets:
             continue
-        label = item.get("label", "")
-        if not label:
-            continue
-        window = evidence_window(note_text, str(label))
-        if window is None:
-            region = item.get("region", "main")
-            if qa_rows is not None:
-                qa_rows.append(
-                    {
-                        "item_key": item.get("item_key", ""),
-                        "label": label,
-                        "region": region,
-                        "section": item.get("section", ""),
-                        "manifest_block_index": item.get("block_index", ""),
-                        "expected_assets": expected_assets,
-                        "local_images": [],
-                        "status": "missing_evidence_reference",
-                    }
-                )
-            warnings.append(
-                {
-                    "kind": "missing_evidence_reference",
-                    "line": 0,
-                    "message": (
-                        f"High-confidence evidence item '{label}' ({region}) with matched asset "
-                        f"is not referenced in the note body. Section: {item.get('section', 'unknown')}"
-                    ),
-                }
-            )
-            continue
-
         local_images = [
             record for record in images if int(window["start"]) <= int(record["start"]) < int(window["end"])
         ]
@@ -676,6 +840,21 @@ def check_evidence_coverage(
                     ),
                 }
             )
+    previous: dict[str, Any] | None = None
+    for current in sorted(ordered_windows, key=lambda row: row["order"]):
+        if previous and current["start"] < previous["start"]:
+            warnings.append(
+                {
+                    "kind": "evidence_order_error",
+                    "line": int(current["line"]),
+                    "message": (
+                        f"Main-region evidence item '{current['label']}' appears before "
+                        f"earlier manifest item '{previous['label']}'."
+                    ),
+                }
+            )
+        if previous is None or current["start"] > previous["start"]:
+            previous = current
     return warnings
 
 
@@ -769,8 +948,22 @@ def main() -> int:
         note_path, assets_dir, text, args.allow_wiki
     )
     errors.extend(link_errors)
-    warnings.extend(link_warnings)
+    if args.strict_assets:
+        errors.extend(
+            warning
+            for warning in link_warnings
+            if warning["kind"] in {"remote_image", "non_assets_relative_image"}
+        )
+        warnings.extend(
+            warning
+            for warning in link_warnings
+            if warning["kind"] not in {"remote_image", "non_assets_relative_image"}
+        )
+    else:
+        warnings.extend(link_warnings)
     warnings.extend(check_section_order(lines))
+    if args.blueprint:
+        errors.extend(check_blueprint_structure(text, Path(args.blueprint).expanduser().resolve()))
     if args.evidence_manifest:
         manifest_path = Path(args.evidence_manifest).expanduser().resolve()
         if manifest_path.is_file():

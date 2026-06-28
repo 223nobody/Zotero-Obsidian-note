@@ -17,8 +17,10 @@ STAGES = [
     "evidence_manifest",
     "draft",
     "review",
+    "quality",
     "validate",
     "cleanup_report",
+    "final_delivery",
 ]
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -41,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--copy-map-path", help="Manifest asset copy-map JSON path.")
     parser.add_argument("--asset-report-path", help="Asset audit JSON path.")
     parser.add_argument("--validation-report-path", help="validate_note.py JSON report path.")
+    parser.add_argument("--quality-report-path", help="audit_note_quality.py JSON report path.")
     parser.add_argument(
         "--stage",
         choices=STAGES,
@@ -88,6 +91,7 @@ def load_sidecar(path: Path) -> dict[str, Any]:
                 "copy_map_path": "",
                 "asset_report_path": "",
                 "validation_report_path": "",
+                "quality_report_path": "",
             },
             "stages": {
                 stage: {"status": "pending", "updated_at": "", "message": ""}
@@ -98,6 +102,7 @@ def load_sidecar(path: Path) -> dict[str, Any]:
             "unused_images": [],
             "review_items": [],
             "validation": {},
+            "quality": {},
             "errors": [],
         }
     return read_json(path)
@@ -148,6 +153,7 @@ def main() -> int:
     update_path(sidecar, "copy_map_path", args.copy_map_path)
     update_path(sidecar, "asset_report_path", args.asset_report_path)
     update_path(sidecar, "validation_report_path", args.validation_report_path)
+    update_path(sidecar, "quality_report_path", args.quality_report_path)
 
     if args.stage:
         status = args.status or "complete"

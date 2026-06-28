@@ -18,6 +18,7 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parent
 BUILD_MANIFEST = SCRIPT_DIR / "build_evidence_manifest.py"
 VALIDATE_NOTE = SCRIPT_DIR / "validate_note.py"
+AUDIT_QUALITY = SCRIPT_DIR / "audit_note_quality.py"
 AUDIT_ASSETS = SCRIPT_DIR / "audit_note_assets.py"
 UPDATE_SIDECAR = SCRIPT_DIR / "update_pipeline_sidecar.py"
 
@@ -27,8 +28,10 @@ STAGES = [
     "evidence_manifest",
     "draft",
     "review",
+    "quality",
     "validate",
     "cleanup_report",
+    "final_delivery",
 ]
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -59,6 +62,26 @@ def parse_args() -> argparse.Namespace:
         "--stages",
         default=",".join(STAGES),
         help=f"Comma-separated subset of stages to run. Available: {', '.join(STAGES)}.",
+    )
+    parser.add_argument(
+        "--production-mode",
+        choices=["single-final", "batch-final-controlled"],
+        default="batch-final-controlled",
+        help="Production mode recorded in reports and sidecars.",
+    )
+    parser.add_argument(
+        "--blueprint",
+        default=str(SCRIPT_DIR.parent / "references" / "blueprint.md"),
+        help="Blueprint structure contract used by validation/quality gates.",
+    )
+    parser.add_argument(
+        "--final-report",
+        help="Optional Markdown batch delivery report path.",
+    )
+    parser.add_argument(
+        "--fail-on-quality-gate",
+        action="store_true",
+        help="Treat non-pass quality reports as batch failures.",
     )
     parser.add_argument(
         "--delete-duplicate-unused",
@@ -201,6 +224,28 @@ def validation_sidecar_fields(report_path: Path | None) -> dict[str, Any]:
     return payload
 
 
+def quality_sidecar_fields(report_path: Path | None) -> dict[str, Any]:
+    if not report_path or not report_path.is_file():
+        return {}
+    report = read_json(report_path)
+    return {
+        "quality": {
+            "status": report.get("status", ""),
+            "report_path": str(report_path),
+            "repair_plan_count": len(report.get("repair_plan", [])),
+            "scores": report.get("scores", {}),
+        },
+        "review_items": [
+            {
+                "section": item.get("section", ""),
+                "problem": item.get("problem", ""),
+                "repair_level": item.get("repair_level", ""),
+            }
+            for item in report.get("repair_plan", [])
+        ],
+    }
+
+
 def asset_sidecar_fields(report: dict[str, Any]) -> dict[str, Any]:
     return {
         "used_images": [
@@ -236,6 +281,105 @@ def fields_to_set_args(fields: dict[str, Any]) -> list[str]:
     return args
 
 
+def final_delivery_status(record: dict[str, Any]) -> tuple[bool, str]:
+    validation_path = first_value(record, "validation_report_path")
+    quality_path = first_value(record, "quality_report_path")
+    asset_path = first_value(record, "asset_report_path")
+    missing = [
+        name
+        for name, value in {
+            "validation_report_path": validation_path,
+            "quality_report_path": quality_path,
+            "asset_report_path": asset_path,
+        }.items()
+        if not value or not Path(value).expanduser().is_file()
+    ]
+    if missing:
+        return False, "Missing final delivery reports: " + ", ".join(missing)
+    validation = read_json(Path(validation_path).expanduser().resolve())
+    quality = read_json(Path(quality_path).expanduser().resolve())
+    asset = read_json(Path(asset_path).expanduser().resolve())
+    if validation.get("status") != "pass":
+        return False, "Validation report is not pass"
+    if quality.get("status") != "pass":
+        return False, f"Quality report is {quality.get('status', 'unknown')}"
+    if int(asset.get("unused_assets_count", 0) or 0) and int(asset.get("image_link_count", 0) or 0) == 0:
+        return False, "Asset report has unused assets but no note image links"
+    return True, "final delivery gates passed"
+
+
+def write_final_report(path: Path, summary: list[dict[str, Any]], production_mode: str) -> None:
+    total = len(summary)
+    passed = sum(
+        1
+        for paper in summary
+        if paper.get("stages", {}).get("final_delivery", {}).get("ok") is True
+    )
+    failed = total - passed
+    lines = [
+        "# Batch Final Delivery Report",
+        "",
+        f"- production_mode: `{production_mode}`",
+        f"- total_papers: {total}",
+        f"- passed_final_delivery: {passed}",
+        f"- failed_or_unfinished: {failed}",
+        "",
+        "| paper_key | final | quality | validation | cleanup | note/source pack | issue |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for paper in summary:
+        stages = paper.get("stages", {})
+        final_stage = stages.get("final_delivery", {})
+        quality = stages.get("quality", {})
+        validate = stages.get("validate", {})
+        cleanup = stages.get("cleanup_report", {})
+        issue = paper.get("error") or final_stage.get("message") or quality.get("message") or ""
+        lines.append(
+            "| {paper_key} | {final} | {quality} | {validation} | {cleanup} | {source_pack} | {issue} |".format(
+                paper_key=paper.get("paper_key", ""),
+                final="pass" if final_stage.get("ok") else "fail",
+                quality=quality.get("status") or ("pass" if quality.get("ok") else ""),
+                validation="pass" if validate.get("ok") else "fail" if validate else "",
+                cleanup="pass" if cleanup.get("ok") else "fail" if cleanup else "",
+                source_pack=paper.get("source_pack_path", ""),
+                issue=str(issue).replace("|", "\\|"),
+            )
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def source_pack_path_for(record: dict[str, Any], work_dir: Path, key: str) -> Path:
+    explicit = first_value(record, "source_pack_path")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    return (work_dir / "source-packs" / f"{key}.source-pack.json").resolve()
+
+
+def write_source_pack(record: dict[str, Any], work_dir: Path, key: str) -> Path:
+    path = source_pack_path_for(record, work_dir, key)
+    payload = {
+        "paper_key": first_value(record, "paper_key", "key", "id") or key,
+        "title": first_value(record, "title"),
+        "pdf_path": first_value(record, "pdf_path"),
+        "source_md": first_value(record, "source_md", "full_md_path", "full_md"),
+        "full_md_path": first_value(record, "source_md", "full_md_path", "full_md"),
+        "content_list": first_value(record, "content_list", "content_list_path"),
+        "content_list_path": first_value(record, "content_list", "content_list_path"),
+        "manifest_json": first_value(record, "parser_manifest", "manifest_json"),
+        "assets_dir": first_value(record, "assets_dir"),
+        "assets_source_dir": first_value(record, "assets_dir"),
+        "note_path": first_value(record, "note_path", "obsidian_note_path"),
+        "note_assets_dir": first_value(record, "note_assets_dir", "assets_dir_for_note"),
+        "copy_map_path": first_value(record, "copy_map_path"),
+        "evidence_manifest_path": first_value(record, "manifest_path"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    record["source_pack_path"] = str(path)
+    return path
+
+
 def update_sidecar(
     sidecar: Path,
     record: dict[str, Any],
@@ -269,6 +413,7 @@ def update_sidecar(
         "--copy-map-path": first_value(record, "copy_map_path"),
         "--asset-report-path": first_value(record, "asset_report_path"),
         "--validation-report-path": first_value(record, "validation_report_path"),
+        "--quality-report-path": first_value(record, "quality_report_path"),
     }
     for flag, value in mappings.items():
         if value:
@@ -355,7 +500,9 @@ def run_review_checkpoint(record: dict[str, Any]) -> tuple[str, str]:
     return "skipped", "manual/LLM review is not automated by batch_note_pipeline.py"
 
 
-def run_manifest(record: dict[str, Any], work_dir: Path, key: str) -> tuple[bool, str, Path | None]:
+def run_manifest(
+    record: dict[str, Any], work_dir: Path, key: str, source_pack_path: Path | None = None
+) -> tuple[bool, str, Path | None]:
     content_list = first_value(record, "content_list", "content_list_path")
     if not content_list:
         return False, "content_list path is missing", None
@@ -373,6 +520,8 @@ def run_manifest(record: dict[str, Any], work_dir: Path, key: str) -> tuple[bool
         str(manifest_path),
         "--split-regions",
     ]
+    if source_pack_path:
+        command.extend(["--source-pack", str(source_pack_path)])
     assets_dir = first_value(record, "assets_dir")
     if assets_dir:
         command.extend(["--assets-dir", str(Path(assets_dir).expanduser().resolve())])
@@ -392,6 +541,7 @@ def run_validation(
     key: str,
     strict_evidence: bool,
     copy_map_authoritative: bool,
+    blueprint: Path | None,
 ) -> tuple[bool, str, Path | None]:
     note = first_value(record, "note_path", "obsidian_note_path")
     if not note:
@@ -405,6 +555,8 @@ def run_validation(
     ).expanduser().resolve()
     report_path.parent.mkdir(parents=True, exist_ok=True)
     command = [sys.executable, str(VALIDATE_NOTE), str(note_path), "--json"]
+    if blueprint:
+        command.extend(["--blueprint", str(blueprint)])
     qa_report_path = report_path.with_suffix(".qa.json")
     manifest = first_value(record, "manifest_path")
     if manifest:
@@ -424,6 +576,44 @@ def run_validation(
     if result.returncode != 0:
         return False, result.stderr or output, report_path
     return True, "note validation passed", report_path
+
+
+def run_quality(
+    record: dict[str, Any],
+    work_dir: Path,
+    key: str,
+    blueprint: Path | None,
+) -> tuple[bool, str, Path | None, dict[str, Any]]:
+    note = first_value(record, "note_path", "obsidian_note_path")
+    if not note:
+        return False, "note_path is missing", None, {}
+    note_path = Path(note).expanduser().resolve()
+    if not note_path.is_file():
+        return False, f"note not found: {note_path}", None, {}
+    report_path = Path(
+        first_value(record, "quality_report_path")
+        or (work_dir / "reports" / f"{key}.quality.json")
+    ).expanduser().resolve()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, str(AUDIT_QUALITY), "--note", str(note_path), "--json"]
+    source_pack = first_value(record, "source_pack_path")
+    if source_pack:
+        command.extend(["--source-pack", str(Path(source_pack).expanduser().resolve())])
+    manifest = first_value(record, "manifest_path")
+    if manifest:
+        command.extend(["--evidence-manifest", str(Path(manifest).expanduser().resolve())])
+    if blueprint:
+        command.extend(["--blueprint", str(blueprint)])
+    result = run(command)
+    output = result.stdout or "{}"
+    report_path.write_text(output if output.endswith("\n") else output + "\n", encoding="utf-8")
+    record["quality_report_path"] = str(report_path)
+    try:
+        report = read_json(report_path)
+    except Exception:
+        report = {"status": "needs_major_repair", "repair_plan": []}
+    ok = report.get("status") == "pass"
+    return ok, f"quality status: {report.get('status', 'unknown')}", report_path, report
 
 
 def run_asset_report(
@@ -471,6 +661,7 @@ def main() -> int:
         raise SystemExit(f"Unknown stages: {', '.join(unknown)}")
 
     work_dir = Path(args.work_dir).expanduser().resolve()
+    blueprint = Path(args.blueprint).expanduser().resolve() if args.blueprint else None
     sidecar_dir = work_dir / "sidecars"
     sidecar_dir.mkdir(parents=True, exist_ok=True)
     papers = load_batch(Path(args.batch_json).expanduser().resolve())
@@ -484,6 +675,17 @@ def main() -> int:
         summary.append(paper_summary)
 
         try:
+            source_pack = write_source_pack(record, work_dir, key)
+            paper_summary["source_pack_path"] = str(source_pack)
+            update_sidecar(
+                sidecar,
+                record,
+                "preflight",
+                "running",
+                "source pack prepared",
+                ["--set", f"production_mode={json.dumps(args.production_mode)}"],
+            )
+
             if "preflight" in requested_stages:
                 ok, message = preflight(record, requested_stages)
                 update_sidecar(sidecar, record, "preflight", "complete" if ok else "failed", message)
@@ -499,7 +701,7 @@ def main() -> int:
                     raise RuntimeError(message)
 
             if "evidence_manifest" in requested_stages:
-                ok, message, manifest_path = run_manifest(record, work_dir, key)
+                ok, message, manifest_path = run_manifest(record, work_dir, key, source_pack)
                 extra = ["--manifest-path", str(manifest_path)] if manifest_path else []
                 extra.extend(counts_to_set_args(manifest_counts(manifest_path)))
                 update_sidecar(
@@ -535,6 +737,20 @@ def main() -> int:
                     "message": message,
                 }
 
+            if "quality" in requested_stages:
+                ok, message, report_path, report = run_quality(record, work_dir, key, blueprint)
+                extra = ["--quality-report-path", str(report_path)] if report_path else []
+                extra.extend(fields_to_set_args(quality_sidecar_fields(report_path)))
+                update_sidecar(sidecar, record, "quality", "complete" if ok else "failed", message, extra)
+                paper_summary["stages"]["quality"] = {
+                    "ok": ok,
+                    "message": message,
+                    "quality_report_path": str(report_path) if report_path else "",
+                    "status": report.get("status", "") if report else "",
+                }
+                if not ok and args.fail_on_quality_gate:
+                    raise RuntimeError(message)
+
             if "validate" in requested_stages:
                 ok, message, report_path = run_validation(
                     record,
@@ -542,6 +758,7 @@ def main() -> int:
                     key,
                     args.strict_evidence,
                     args.copy_map_authoritative,
+                    blueprint,
                 )
                 extra = ["--validation-report-path", str(report_path)] if report_path else []
                 extra.extend(counts_to_set_args(validation_counts(report_path)))
@@ -600,11 +817,32 @@ def main() -> int:
                 }
                 if not ok:
                     raise RuntimeError(message)
+
+            if "final_delivery" in requested_stages:
+                ok, message = final_delivery_status(record)
+                update_sidecar(
+                    sidecar,
+                    record,
+                    "final_delivery",
+                    "complete" if ok else "failed",
+                    message,
+                    ["--set", f"final_status={json.dumps('pass' if ok else 'fail')}"],
+                )
+                paper_summary["stages"]["final_delivery"] = {"ok": ok, "message": message}
+                if not ok:
+                    raise RuntimeError(message)
         except Exception as exc:
             exit_code = 1
             paper_summary["error"] = str(exc)
             if not args.continue_on_error:
                 break
+
+    if args.final_report:
+        write_final_report(
+            Path(args.final_report).expanduser().resolve(),
+            summary,
+            args.production_mode,
+        )
 
     print(json.dumps({"work_dir": str(work_dir), "papers": summary}, ensure_ascii=False, indent=2))
     return exit_code

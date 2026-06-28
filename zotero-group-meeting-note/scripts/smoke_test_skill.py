@@ -15,6 +15,8 @@ SKILL_DIR = SCRIPT_DIR.parent
 BUILD_MANIFEST = SCRIPT_DIR / "build_evidence_manifest.py"
 PREPARE_OUTPUT = SCRIPT_DIR / "prepare_output.py"
 VALIDATE_NOTE = SCRIPT_DIR / "validate_note.py"
+VALIDATE_EVIDENCE = SCRIPT_DIR / "validate_evidence_coverage.py"
+AUDIT_QUALITY = SCRIPT_DIR / "audit_note_quality.py"
 COLLECT_ASSETS = SCRIPT_DIR / "collect_assets.py"
 AUDIT_ASSETS = SCRIPT_DIR / "audit_note_assets.py"
 UPDATE_SIDECAR = SCRIPT_DIR / "update_pipeline_sidecar.py"
@@ -158,6 +160,8 @@ def main() -> int:
         assert_true("asset_hashes" in figure_two, "asset_hashes missing from merged item")
         assert_true("source_text" in figure_item, "source_text missing from manifest item")
         assert_true("final_section" in figure_item, "final_section missing from manifest item")
+        assert_true("target_section" in figure_item, "target_section missing from manifest item")
+        assert_true("required_in_final" in figure_item, "required_in_final missing from manifest item")
         assert_true("page" in figure_item, "page missing from manifest item")
         assert_true("block_index" in figure_item, "block_index missing from manifest item")
 
@@ -364,6 +368,24 @@ def main() -> int:
 
         note = root / "note.md"
         note.write_text(
+            "# Group Meeting Note: Smoke\n\n"
+            "## Paper Basic Information\n\nSmoke paper.\n\n"
+            "## Core Conclusion\n\n"
+            "This note explains the method, evidence, boundary, and discussion.\n\n"
+            "## Problem Background And Research Positioning\n\n"
+            "The old route lacks a controlled skill gate and source-order evidence binding.\n\n"
+            "## Innovation Analysis\n\n"
+            "The innovation is a controlled evidence timeline with validation gates.\n\n"
+            "## Method Or System Mechanism\n\n"
+            "The pipeline builds a manifest, copies assets, writes a note, and validates gates.\n\n"
+            "## Figure Table Formula Explanation\n\n"
+            "#### Figure 1: Method overview\n\n"
+            "![Figure 1](assets/figure-1.png)\n\n"
+            "Figure 1 explains the pipeline mechanism and supports the main design claim.\n\n"
+            "## Related Work Comparison And Connection\n\n"
+            "Compared with loose batch prompting, this route separates drafting and validation.\n\n"
+            "## Strengths Limitations And Discussion Questions\n\n"
+            "The advantage is traceability. The limitation is that semantic quality still needs review.\n\n"
             "# 组会分享笔记：Smoke\n\n"
             "## 五、图表公式解释\n\n"
             "#### Figure 1：Method overview\n\n"
@@ -372,6 +394,75 @@ def main() -> int:
         )
         validate_result = run([sys.executable, str(VALIDATE_NOTE), str(note), "--json"])
         assert_true(validate_result.returncode == 0, validate_result.stdout + validate_result.stderr)
+
+        quality_result = run(
+            [
+                sys.executable,
+                str(AUDIT_QUALITY),
+                "--note",
+                str(note),
+                "--evidence-manifest",
+                str(manifest_path),
+                "--blueprint",
+                str(SKILL_DIR / "references" / "blueprint.md"),
+                "--json",
+            ]
+        )
+        assert_true(quality_result.returncode != 0, "short smoke note should not pass quality gate")
+        quality_data = json.loads(quality_result.stdout)
+        assert_true(
+            quality_data["status"] in {"needs_minor_repair", "needs_major_repair", "needs_regeneration"},
+            "quality audit should return a repair status",
+        )
+
+        note.write_text(
+            "# 组会分享笔记：Smoke\n\n"
+            "## 论文基本信息\n\n"
+            "这是一篇用于验证批量受控终稿流水线的 smoke paper，论文类型视为系统/方法类。\n\n"
+            "## 一、核心结论\n\n"
+            "这篇论文的核心结论是：如果组会笔记要批量生成，就必须把 source pack、evidence manifest、资产迁移、结构校验和质量审稿拆成独立 gate。"
+            "Figure 1 给出整体流程，Figure 2 展示蒸馏动态，Table 1 说明主结果比较，Figure A1 和 Supplementary Figure 1 用来验证补充材料路由。"
+            "结论成立的边界是：自动 gate 能发现结构和证据问题，但语义深度仍需要 review pass 进行补强。\n\n"
+            "## 二、问题背景与研究定位\n\n"
+            "旧路线的问题不是单篇写作能力完全失效，而是批量上下文会让多篇论文共享同一套浅层表达。"
+            "本文把问题定位在批量生成的控制面：每篇论文都需要独立 source pack，避免跨论文污染；每个图表公式都需要 evidence manifest，避免只靠记忆补写。"
+            "因此它属于组会笔记生产流水线的工程化控制问题，而不是重新发明笔记结构模板。\n\n"
+            "## 三、创新点分析\n\n"
+            "第一，流水线把 evidence manifest 作为写作前的硬约束，确保 Figure/Table/Equation 不会被批量摘要吞掉。"
+            "第二，blueprint structure gate 复用现有 blueprint，而不是新建并行结构文件。"
+            "第三，quality gate 把章节存在和内容达标分开，能识别只有标题、没有机制解释和结果分析的空心稿。"
+            "这些创新点分别由 Figure 1、Table 1 和补充材料路由测试支撑。\n\n"
+            "## 四、方法或系统机制\n\n"
+            "系统流程是：先检查输入 PDF、full.md、content_list.json 和 assets，再为单篇论文写入 source pack。"
+            "随后 build_evidence_manifest.py 生成 Figure/Table/Equation 的顺序化清单，prepare_output.py 复制匹配资产，validate_note.py 和 audit_note_quality.py 分别执行结构/证据/资产和内容深度检查。"
+            "这个机制的关键是每篇论文独立运行，主 agent 只汇总 gate 报告和最终交付状态。\n\n"
+            "## 五、图表公式解释\n\n"
+            "#### Figure 1：Method overview\n\n"
+            "![Figure 1](assets/figure-1.png)\n\n"
+            "Figure 1 展示主流程：输入材料先被整理为 source pack，再生成 evidence manifest，最后经过结构、证据、资产和质量 gate。"
+            "它证明的不是某个模型能力提升，而是批量生产过程可以被拆成可验证的状态机。\n\n"
+            "#### Figure 2：Distillation dynamics\n\n"
+            "![Figure 2](assets/figure-2.png)\n\n"
+            "Figure 2 用来验证相邻图片块与 caption 的绑定逻辑。它说明 manifest 不只记录 label，还要把附近图片合并到同一个证据条目，避免图片被丢到文末资源索引。\n\n"
+            "#### Table 1：Main result comparison\n\n"
+            "![Table 1](assets/table-1.png)\n\n"
+            "Table 1 是主结果比较，重点不是表格本身，而是验证 evidence gate 会要求表格条目出现在终稿中，并在对应位置解释比较对象、指标和结论边界。\n\n"
+            "## 六、与相关工作的对比与联系\n\n"
+            "相比只依赖 prompt 的批量写作，这条路线更接近可审计的数据处理流水线。"
+            "它和普通 Markdown 校验不同，因为它不仅检查链接是否存在，还检查证据是否按原文顺序进入 blueprint 指定章节。"
+            "它和人工逐篇修稿也不同，因为它先用 gate 缩小问题范围，再让人工或模型集中修复高风险章节。\n\n"
+            "## 七、优点、局限与讨论问题\n\n"
+            "优点是可追踪、可复跑、可区分生成成功和质量通过。局限是质量 gate 仍然是启发式，不能替代完整论文阅读。"
+            "可以讨论的问题包括：required evidence 的粒度如何设定、低置信度图片是否需要人工核对、以及质量分数是否应该按论文类型调整。\n\n"
+            "## 八、参考文献后内容与补充材料\n\n"
+            "### Figure A1：Appendix diagnostic plot\n\n"
+            "![Figure A1](assets/figure-1.png)\n\n"
+            "Figure A1 属于 appendix 证据，不应混入主文证据时间线。它用于验证补充材料必须进入单独章节。\n\n"
+            "### Supplementary Figure 1：Extra failure case\n\n"
+            "![Supplementary Figure 1](assets/supp-figure-1.png)\n\n"
+            "Supplementary Figure 1 属于参考文献后的补充内容，用于说明 post-reference evidence 也要覆盖，但位置应在补充材料章节。\n",
+            encoding="utf-8",
+        )
 
         collect_source = root / "collect-source.md"
         collect_source.write_text(
@@ -544,6 +635,20 @@ def main() -> int:
             any(w["kind"] == "missing_evidence_asset_link" for w in coverage["warnings"]),
             "validate_note should warn when a high-confidence manifest asset is not linked",
         )
+
+        evidence_gate_result = run(
+            [
+                sys.executable,
+                str(VALIDATE_EVIDENCE),
+                "--note",
+                str(missing_asset_note),
+                "--evidence-manifest",
+                str(coverage_manifest),
+                "--strict",
+                "--json",
+            ]
+        )
+        assert_true(evidence_gate_result.returncode != 0, "strict evidence gate should fail missing assets")
 
         wrong_placement_note = root / "wrong-placement-note.md"
         wrong_placement_note.write_text(
@@ -734,7 +839,7 @@ def main() -> int:
         )
         assert_true(audit_result.returncode == 0, audit_result.stderr)
         audit = json.loads(asset_report.read_text(encoding="utf-8"))
-        assert_true(audit["image_link_count"] == 1, "asset audit image count mismatch")
+        assert_true(audit["image_link_count"] >= 1, "asset audit image count mismatch")
         assert_true(audit["assets_total"] >= 5, "asset audit total asset count mismatch")
         assert_true(audit["unused_assets_count"] >= 4, "asset audit unused count mismatch")
         assert_true(audit["duplicate_hash_count"] >= 1, "asset audit duplicate hash missing")
@@ -861,8 +966,10 @@ def main() -> int:
                 "--work-dir",
                 str(full_work),
                 "--stages",
-                "preflight,parse_cache,evidence_manifest,draft,review,validate,cleanup_report",
+                "preflight,parse_cache,evidence_manifest,draft,review,quality,validate,cleanup_report",
                 "--continue-on-error",
+                "--final-report",
+                str(root / "batch-final-report.md"),
             ]
         )
         assert_true(full_batch_result.returncode == 0, full_batch_result.stdout + full_batch_result.stderr)
@@ -878,6 +985,14 @@ def main() -> int:
         assert_true(
             full_sidecar["stages"]["review"]["status"] == "skipped",
             "batch sidecar review checkpoint should be explicit when not automated",
+        )
+        assert_true(
+            full_sidecar["stages"]["quality"]["status"] == "failed",
+            "batch sidecar quality gate should record short-note failure",
+        )
+        assert_true(
+            "quality_report_path" in full_sidecar["paths"],
+            "batch sidecar should record quality report path",
         )
         assert_true(
             full_sidecar["counts"]["image_link_count"] >= 1,

@@ -49,6 +49,31 @@ python scripts/validate_note.py "<note-path>"
 
 Treat any error as a failed review. Fix the note and rerun the script. Warnings should be resolved when they indicate broken local links, stale wiki embeds, or supplementary sections in the wrong place; otherwise report the remaining warning briefly.
 
+## Final Note Gate Review
+
+For `single-final` and `batch-final-controlled`, record a gate decision before delivery:
+
+```text
+pass | needs_minor_repair | needs_major_repair | needs_regeneration
+```
+
+Check these gates in order:
+
+- `blueprint_structure`: the note follows `references/blueprint.md` as the single structure contract, keeps the required analytical line, and does not invent a parallel structure.
+- `evidence_coverage`: required Figure / Table / Equation / Algorithm / Prompt / Case evidence from the manifest is present, ordered correctly, and explained rather than caption-repeated.
+- `asset_status`: all final note image links are note-local `assets/...`, matched images sit beside the evidence they support, and no MinerU asset dump appears in the note body.
+- `content_depth`: core conclusion, problem positioning, innovation, mechanism, results, related work, limitations, and discussion are substantive enough for a group meeting.
+- `domain_consistency`: the note correctly treats the paper as method/system/survey/benchmark/security/etc. and reads the matching domain reference when available.
+- `terminology`: recurring technical English phrases have stable inline Chinese explanations at first important mention.
+
+Failure levels:
+
+- `needs_minor_repair`: local order, terminology, formatting, or short explanation gaps.
+- `needs_major_repair`: missing required evidence, hollow chapters, weak result analysis, or wrong section responsibility.
+- `needs_regeneration`: wrong paper type, wrong domain, severe shallow-summary behavior, or a draft that cannot be repaired section-by-section.
+
+Every failed gate must include the problem location, violated rule, missing evidence or source cue, and recommended repair level. Batch runs must keep this decision in the per-paper sidecar or quality report; a note that is not `pass` must not be counted as a completed final note.
+
 ## Translation Style Preferences
 
 - Prefer community-standard Chinese renderings over literal word-by-word translation.

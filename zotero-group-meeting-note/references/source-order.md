@@ -81,6 +81,17 @@ Treat an item as non-core when it is mainly auxiliary: repeated trend plots, sup
 - If an image crop has no label, match it to the nearest caption, heading, or numbered mention within a small neighborhood. If no reliable match exists, record it as `未匹配图片` in an internal checklist or external manifest only; do not place it in the final note or supplementary section.
 - The supplementary section is for real paper content after References/Bibliography, not for MinerU asset auditing. A final note must not include `## 附录：MinerU 图片资源完整性索引`, `MinerU asset`, `MinerU extra crop`, or a filename-only asset dump.
 
+## Strict Evidence Gate Rules
+
+Use these rules when running batch or final-note validation:
+
+- Manifest rows marked `required_in_final=true` must appear in the final note unless they are explicitly marked `寰呮牳瀵瑰師鏂囷細<label>`.
+- Main-region required evidence must appear in the main mixed evidence timeline specified by `references/blueprint.md`; appendix or post-reference evidence must not be mixed into that main timeline.
+- Strict mode fails when main-region Figure / Table / Equation / Algorithm / Prompt / Case entries are reordered against manifest order.
+- A matched asset must appear in the local window for its evidence item, not only in a later appendix or resource index.
+- Missing matched images, misplaced matched images, missing labels, and caption-only explanations are evidence gate failures.
+- Unmatched parser images remain in the manifest or audit report. They must not be added to the final note just to improve asset counts.
+
 ## Final Check
 
 Before delivery, compare `## 五、图表公式解释` and `## 八、参考文献后内容与补充材料` against the inventory or evidence manifest and verify that no item was moved to support a smoother narrative at the cost of original-paper order, every matched asset appears in its corresponding evidence entry, and unmatched assets were kept out of the final note unless the user explicitly requested an asset audit. If a user asks for an audit, put it in a separate manifest file, not in the seminar note.

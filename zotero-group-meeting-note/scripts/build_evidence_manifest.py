@@ -84,7 +84,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create a source-order evidence manifest from MinerU content_list.json."
     )
-    parser.add_argument("content_list", help="MinerU content_list.json path.")
+    parser.add_argument("content_list", nargs="?", help="MinerU content_list.json path.")
+    parser.add_argument(
+        "--source-pack",
+        help=(
+            "Optional per-paper source_pack.json. Missing content_list, assets_dir, "
+            "full_md, title, and note paths are read from it."
+        ),
+    )
     parser.add_argument(
         "--assets-dir",
         help="MinerU assets directory used to resolve relative asset paths.",
@@ -472,6 +479,26 @@ def final_section_for(region: str) -> str:
     return "## 五、图表公式解释"
 
 
+def required_in_final_for(item_type: str, region: str, confidence_value: str) -> bool:
+    if confidence_value == "low":
+        return False
+    if region in {"main", "appendix", "post_reference"}:
+        return True
+    return item_type in {
+        "Figure",
+        "Table",
+        "Equation",
+        "Algorithm",
+        "Objective",
+        "Loss",
+        "Score",
+        "Constraint",
+        "Prompt",
+        "Case Study",
+        "Checklist",
+    }
+
+
 def label_sort_key(label: str) -> str:
     return re.sub(r"\s+", " ", label.strip().lower())
 
@@ -768,6 +795,7 @@ def build_item_from_blocks(
         "label_key": label_sort_key(label),
         "region": label_block["region"],
         "final_section": final_section_for(label_block["region"]),
+        "target_section": final_section_for(label_block["region"]),
         "section": label_block["section"],
         "block_index": label_block["block_index"],
         "page": label_block.get("page", ""),
@@ -790,6 +818,7 @@ def build_item_from_blocks(
         "matched_asset": asset_paths[0] if asset_paths else "",
         "match_confidence": conf,
         "confidence": conf,
+        "required_in_final": required_in_final_for(item_type, label_block["region"], conf),
         "match_reason": conf_reason
         if not unresolved_asset_candidates
         else conf_reason + "; incompatible adjacent asset candidates require review",
@@ -918,6 +947,10 @@ def build_manifest(
             "assets_dir": str(assets_dir) if assets_dir else "",
             "full_md_path": str(full_md_path) if full_md_path else "",
         },
+        "paper_key": "",
+        "title": "",
+        "note_path": "",
+        "note_assets_dir": "",
         "total_raw_items": raw_item_count,
         "total_items": len(filtered_items),
         "source_block_count": raw_source_block_count,
@@ -939,6 +972,31 @@ def iter_manifest_items(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     if "items" in manifest:
         return list(manifest.get("items", []))
     return list(manifest.get("main_items", [])) + list(manifest.get("post_reference_items", []))
+
+
+def source_pack_value(source_pack: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = source_pack.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    paths = source_pack.get("paths")
+    if isinstance(paths, dict):
+        for key in keys:
+            value = paths.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def apply_source_pack_metadata(manifest: dict[str, Any], source_pack: dict[str, Any], path: Path) -> None:
+    manifest["source_pack_path"] = str(path)
+    manifest["paper_key"] = source_pack_value(source_pack, "paper_key", "key", "id")
+    manifest["title"] = source_pack_value(source_pack, "title")
+    manifest["note_path"] = source_pack_value(source_pack, "note_path", "obsidian_note_path")
+    manifest["note_assets_dir"] = source_pack_value(
+        source_pack, "note_assets_dir", "assets_dir_for_note"
+    )
+    manifest.setdefault("source", {})["source_pack_path"] = str(path)
 
 
 def markdown_table(manifest: dict[str, Any]) -> str:
@@ -986,9 +1044,26 @@ def markdown_table(manifest: dict[str, Any]) -> str:
 
 def main() -> int:
     args = parse_args()
-    content_list_path = Path(args.content_list).expanduser().resolve()
-    assets_dir = Path(args.assets_dir).expanduser().resolve() if args.assets_dir else None
-    full_md_path = Path(args.full_md).expanduser().resolve() if args.full_md else None
+    source_pack: dict[str, Any] = {}
+    source_pack_path: Path | None = None
+    if args.source_pack:
+        source_pack_path = Path(args.source_pack).expanduser().resolve()
+        source_pack = read_json(source_pack_path)
+
+    content_list_arg = args.content_list or source_pack_value(
+        source_pack, "content_list", "content_list_path", "content_list_json"
+    )
+    assets_arg = args.assets_dir or source_pack_value(
+        source_pack, "assets_dir", "assets_source_dir", "parser_assets_dir"
+    )
+    full_md_arg = args.full_md or source_pack_value(
+        source_pack, "source_md", "full_md_path", "full_md"
+    )
+    if not content_list_arg:
+        raise SystemExit("content_list is required unless --source-pack provides it")
+    content_list_path = Path(content_list_arg).expanduser().resolve()
+    assets_dir = Path(assets_arg).expanduser().resolve() if assets_arg else None
+    full_md_path = Path(full_md_arg).expanduser().resolve() if full_md_arg else None
     manifest = build_manifest(
         content_list_path,
         assets_dir,
@@ -996,6 +1071,8 @@ def main() -> int:
         min_confidence=args.min_confidence,
         split_regions=args.split_regions,
     )
+    if source_pack_path:
+        apply_source_pack_metadata(manifest, source_pack, source_pack_path)
     output = markdown_table(manifest) if args.markdown else json.dumps(manifest, ensure_ascii=False, indent=2)
     if args.output:
         Path(args.output).expanduser().resolve().write_text(output + "\n", encoding="utf-8")

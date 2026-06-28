@@ -2,6 +2,22 @@
 
 Use this reference when validating generated notes or after changing skill scripts/references.
 
+## Final-Note Gate Sequence
+
+For `single-final` and `batch-final-controlled`, validate each paper with these gates:
+
+1. `preflight gate`: required source paths and output paths exist.
+2. `source pack gate`: one paper has one isolated source pack; later reports refer back to it.
+3. `evidence manifest gate`: `content_list.json` / `full.md` evidence is represented in a private manifest.
+4. `blueprint structure gate`: the note follows `references/blueprint.md` as the single structure contract.
+5. `evidence coverage gate`: required manifest evidence appears in the correct final sections and order.
+6. `asset gate`: final note images are local, resolved, and not a parser asset dump.
+7. `quality gate`: content depth is seminar-ready and not only a summary.
+8. `domain consistency gate`: paper type and domain-specific emphasis are correct.
+9. `final delivery gate`: reports and sidecar status distinguish generated files from passed final notes.
+
+Batch completion means all gates pass for that paper. A failed quality or evidence gate must trigger repair or remain in the unresolved list.
+
 ## Per-Note Validation
 
 After writing a note to disk, run:
@@ -37,6 +53,7 @@ For notes already drafted, validate structure and write a JSON report when the r
 
 ```powershell
 python scripts/validate_note.py "<note-path>" `
+  --blueprint "references/blueprint.md" `
   --evidence-manifest "<working-evidence-manifest.json>" `
   --copy-map "<copy-map.json>" `
   --strict-evidence `
@@ -44,6 +61,19 @@ python scripts/validate_note.py "<note-path>" `
 ```
 
 When `--evidence-manifest` is used without `--strict-evidence`, warnings such as `missing_evidence_reference`, `missing_evidence_asset_link`, and `misplaced_evidence_asset_link` mean the note is structurally readable but does not fully satisfy evidence placement. Use `--strict-evidence` for batch delivery so those gaps fail validation.
+
+For content-depth review, write a separate quality report:
+
+```powershell
+python scripts/audit_note_quality.py `
+  --note "<note-path>" `
+  --source-pack "<source-pack.json>" `
+  --evidence-manifest "<working-evidence-manifest.json>" `
+  --blueprint "references/blueprint.md" `
+  --json > "<quality-report.json>"
+```
+
+Treat `needs_minor_repair`, `needs_major_repair`, and `needs_regeneration` as unfinished states for final delivery unless the unresolved issue is explicitly accepted and reported.
 
 Then write a separate asset report:
 

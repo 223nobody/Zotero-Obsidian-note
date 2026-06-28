@@ -124,6 +124,20 @@ Use these recurring patterns when writing the mixed evidence timeline:
 - Learned skills encode stale APIs, private environment assumptions, benchmark leakage, brittle tool names, or non-portable file paths.
 - Prompt screenshots and appendix crops are treated as evidence without explaining whether they affect the method or only document implementation.
 
+## Domain Consistency Gate
+
+Use this gate before marking an agent-skill note as final. The gate changes what to check, not the fixed structure in `references/blueprint.md`.
+
+- Skill architecture papers must explain framework boundaries, component responsibilities, loading points, and execution flow.
+- Skill acquisition papers must explain skill sources, extraction/generation procedure, filtering, evaluation, and transfer boundary.
+- Skill retrieval / routing papers must explain index construction, query/selection logic, context injection, conflict handling, and downstream execution evidence.
+- Skill composition / graph papers must explain dependencies, edge semantics, planner decisions, and failure when relations are wrong.
+- Skill security / governance papers must explain threat model, attack surface, realized runtime behavior, defenses, false positives, and deployment assumptions.
+- Skill internalization / LoRA / latent-skill papers must explain how external skills become model behavior, what objective or distillation signal is used, and what preserves or loses skill semantics.
+- HCI / user-comprehension skill papers must explain user-study design, participants, tasks, metrics, ecological validity, and whether users can actually detect or control skill risk.
+
+Fail the domain gate as `needs_major_repair` when the note misses the lifecycle stage or evidence type. Fail as `needs_regeneration` when a method/system/security/survey paper is treated as the wrong paper type.
+
 ## Note-Writing Emphasis
 
 - In the core conclusion, name the exact skill object and lifecycle stage, not only "improves agents."

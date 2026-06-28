@@ -17,6 +17,15 @@ Use this skill to produce a seminar-ready computer-science paper note, not a sha
 - Save the note to the exact requested destination, or use the default Obsidian/Zotero-compatible output contract.
 - Prefer `paper-search-mcp` parsed artifacts when available, using MinerU `full.md`, `content_list.json`, `manifest.json`, and `assets/` as a structured source pack.
 
+## Production Modes
+
+- `single-final`: generate one complete final seminar note for one paper.
+- `batch-final-controlled`: generate multiple final seminar notes, but process each paper as an isolated unit and require source, blueprint-structure, evidence, asset, quality, domain-consistency, and delivery gates before marking it complete.
+
+For final seminar notes, use `references/blueprint.md` as the single source of truth for note structure and section responsibilities. Do not create or follow a parallel final-note structure. Batch mode must enforce the same blueprint through validation gates.
+
+For `batch-final-controlled` runs, each paper must have its own source pack, evidence manifest, note path, assets directory, validation report, quality report, and repair status. Batch mode may directly produce final notes, but only notes that pass all gates may be counted as complete.
+
 ## Rule Precedence
 
 When instructions appear to compete, resolve them in this order:
@@ -36,7 +45,8 @@ When instructions appear to compete, resolve them in this order:
 - If an existing note is provided, preserve useful manual comments, images, terminology, and structure while fixing gaps.
 - If `paper-search-mcp` is available or the user provides a title/search query/DOI/PDF path/`paper_key`, read `references/mcp-paper-search.md` and prefer the MCP parsed-cache flow before falling back to raw PDF extraction.
 - Build a source pack when possible: `paper_key`, `pdf_path`, `full_md_path`, `content_list_path`, `manifest_path`, `assets_dir`, `result_zip_path`, and parser provenance. Use this source pack as the stable input for drafting and verification.
-- For batch or multi-paper runs, track each paper in a JSON sidecar with `scripts/update_pipeline_sidecar.py`, or run deterministic parts with `scripts/batch_note_pipeline.py`. Use the stages `preflight -> parse_cache -> evidence_manifest -> draft -> review -> validate -> cleanup_report`, and keep paths, copy maps, counts, validation results, and unresolved errors in the sidecar rather than in the note body.
+- For batch or multi-paper runs, track each paper in a JSON sidecar with `scripts/update_pipeline_sidecar.py`, or run deterministic parts with `scripts/batch_note_pipeline.py`. Use the stages `preflight -> parse_cache -> evidence_manifest -> draft -> review -> quality -> validate -> cleanup_report -> final_delivery`, and keep paths, copy maps, counts, validation results, quality decisions, repair status, and unresolved errors in the sidecar rather than in the note body.
+- In batch mode, never use one paper's draft body as context for another paper. Share only the batch manifest, sidecar status, and gate reports.
 
 ### 2. Prepare Output Paths Before Writing
 
@@ -132,6 +142,7 @@ For every important figure, table, formula, and result:
 - Read `references/terminology.md` when translating technical terms, and prefer its standard renderings when they fit the paper.
 - When full text is available as Markdown or text, consider running `scripts/extract_terms.py <source-file>` to collect recurring English term candidates before polishing.
 - When the note has been written to disk, run `scripts/validate_note.py <note-path>` to catch banned MinerU asset indexes, absolute/stale image links, missing `assets/...` files, and resource-dump sections before reporting completion. If an evidence manifest exists, run `scripts/validate_note.py <note-path> --evidence-manifest <manifest.json> --copy-map <copy-map.json> --strict-evidence` for batch delivery or whenever image placement must be enforced.
+- For final or batch delivery, also run `scripts/audit_note_quality.py --note <note-path> --source-pack <source-pack.json> --evidence-manifest <manifest.json> --blueprint references/blueprint.md --json` when the source pack exists. Treat `needs_minor_repair`, `needs_major_repair`, and `needs_regeneration` as unfinished states until the requested repair loop has run or the unresolved issue is reported.
 - First review the note against the paper and `references/blueprint.md`: remove unsupported claims, mark missing evidence, fix section gaps, and trim repetition.
 - Then scan for recurring technical English phrases and add inline Chinese translations on first important mention using the format `English phrase（中文翻译）`.
 - Prioritize phrases that are central to the task, method, objective, system module, decision frontier, or repeated experimental comparison.
@@ -204,6 +215,7 @@ Before reporting completion:
 - Verify the final note does not contain `## 附录：MinerU 图片资源完整性索引`, `MinerU asset`, `MinerU extra crop`, or a raw list of `assets/...` files.
 - Verify note image links resolve to files in the note-local `assets/` folder, especially when the source images came from MCP `assets_dir`.
 - Verify `scripts/validate_note.py <note-path>` passes, or report its remaining errors explicitly.
+- Verify the final quality status is `pass` when a quality report was generated. If it is not `pass`, report the repair level and do not count the note as a completed final note.
 - Verify appendix/post-reference supplementary content is handled in `## 八、参考文献后内容与补充材料` when present.
 - Verify recurring technical English phrases are translated on first key mention and remain terminology-consistent.
 - Report final paths, `paper_key` when applicable, and unresolved placeholders or asset-binding gaps.
