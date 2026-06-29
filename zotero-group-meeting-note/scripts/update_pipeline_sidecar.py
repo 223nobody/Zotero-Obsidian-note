@@ -19,6 +19,7 @@ STAGES = [
     "review",
     "quality",
     "validate",
+    "repair",
     "cleanup_report",
     "final_delivery",
 ]

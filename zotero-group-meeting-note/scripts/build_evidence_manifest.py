@@ -479,11 +479,33 @@ def final_section_for(region: str) -> str:
     return "## 五、图表公式解释"
 
 
-def required_in_final_for(item_type: str, region: str, confidence_value: str) -> bool:
+def required_in_final_for(
+    item_type: str,
+    region: str,
+    confidence_value: str,
+    core_level: str = "",
+    label: str = "",
+) -> bool:
+    # Low-confidence items are never required — they need human review first.
     if confidence_value == "low":
         return False
-    if region in {"main", "appendix", "post_reference"}:
-        return True
+    # Candidate labels (inferred without reliable paper numbering) are not required.
+    if "candidate" in label.lower():
+        return False
+    # Appendix and post-reference items are supplementary — not required in main body.
+    if region in {"appendix", "post_reference"}:
+        return False
+    # In main region, only core-candidate items with high/medium confidence are required.
+    if region == "main":
+        if core_level == "core_candidate" and confidence_value in {"high", "medium"}:
+            return True
+        # High-confidence items in main region are always required.
+        if confidence_value == "high":
+            return True
+        return False
+    # Fallback: only require well-typed items with at least medium confidence.
+    if confidence_value not in {"high", "medium"}:
+        return False
     return item_type in {
         "Figure",
         "Table",
@@ -818,7 +840,7 @@ def build_item_from_blocks(
         "matched_asset": asset_paths[0] if asset_paths else "",
         "match_confidence": conf,
         "confidence": conf,
-        "required_in_final": required_in_final_for(item_type, label_block["region"], conf),
+        "required_in_final": required_in_final_for(item_type, label_block["region"], conf, core_level, label),
         "match_reason": conf_reason
         if not unresolved_asset_candidates
         else conf_reason + "; incompatible adjacent asset candidates require review",

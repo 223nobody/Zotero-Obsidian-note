@@ -11,6 +11,7 @@ import argparse
 import json
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -30,12 +31,33 @@ STAGES = [
     "review",
     "quality",
     "validate",
+    "repair",
     "cleanup_report",
     "final_delivery",
 ]
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Quality-report status to repair-level mapping
+# ---------------------------------------------------------------------------
+
+_QUALITY_STATUS_REPAIR_MAP: dict[str, str] = {
+    "needs_minor_repair": "minor",
+    "needs_major_repair": "major",
+    "needs_regeneration": "regeneration",
+}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ============================================================================
+# CLI
+# ============================================================================
 
 
 def parse_args() -> argparse.Namespace:
@@ -103,7 +125,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Continue to the next paper after a stage failure.",
     )
+    parser.add_argument(
+        "--repair-rounds",
+        type=int,
+        default=0,
+        help="Maximum repair rounds when quality/validation fail (0-2, default 0).",
+    )
     return parser.parse_args()
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
 
 
 def run(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -281,7 +314,185 @@ def fields_to_set_args(fields: dict[str, Any]) -> list[str]:
     return args
 
 
-def final_delivery_status(record: dict[str, Any]) -> tuple[bool, str]:
+# ============================================================================
+# Repair helpers
+# ============================================================================
+
+
+def determine_repair_level(quality_report: dict[str, Any]) -> str:
+    """Map a quality report status to a repair level string."""
+    status = (quality_report.get("status") or "").strip()
+    return _QUALITY_STATUS_REPAIR_MAP.get(status, "major")
+
+
+def _derive_failed_gates(quality_report: dict[str, Any]) -> list[str]:
+    """Extract likely failed gates from the quality report."""
+    gates: list[str] = []
+
+    # 1) Explicit failed_gates list in the report
+    explicit = quality_report.get("failed_gates")
+    if isinstance(explicit, list) and explicit:
+        return [str(g) for g in explicit]
+
+    # 2) Derive from repair_plan section names
+    for item in quality_report.get("repair_plan", []):
+        section = str(item.get("section", "")).strip()
+        if section and section not in gates:
+            gates.append(section)
+
+    # 3) Derive from scores: numeric scores < 1.0 or string scores != "pass"
+    scores = quality_report.get("scores", {})
+    if isinstance(scores, dict):
+        for key, value in scores.items():
+            if isinstance(value, (int, float)) and value < 1.0:
+                if key not in gates:
+                    gates.append(key)
+            elif isinstance(value, str) and value.lower() != "pass":
+                if key not in gates:
+                    gates.append(key)
+
+    return gates
+
+
+def build_repair_actions(
+    repair_plan: list[dict[str, Any]], repair_level: str
+) -> list[dict[str, Any]]:
+    """Convert quality-report repair_plan items into repair-instruction actions."""
+    actions: list[dict[str, Any]] = []
+
+    action_kind: str
+    if repair_level == "minor":
+        action_kind = "patch"
+    elif repair_level == "regeneration":
+        action_kind = "regenerate"
+    else:
+        action_kind = "rewrite"
+
+    for item in repair_plan:
+        section = item.get("section", "")
+        problem = item.get("problem", "")
+        item_level = item.get("repair_level", "")
+
+        # Use the per-item repair_level to refine the action verb
+        if item_level == "minor":
+            verb = "patch"
+        elif item_level == "major":
+            verb = "rewrite"
+        elif item_level == "regeneration":
+            verb = "regenerate"
+        else:
+            verb = action_kind
+
+        actions.append(
+            {
+                "section": section,
+                "problem": problem,
+                "action": verb,
+                "guidance": problem,
+            }
+        )
+
+    # Fallback when the repair_plan is empty but the report signals non-pass
+    if not actions and repair_level in ("major", "regeneration"):
+        actions.append(
+            {
+                "section": "entire note",
+                "problem": "Quality report signals major issues requiring full rewrite or regeneration.",
+                "action": "regenerate" if repair_level == "regeneration" else "rewrite",
+                "guidance": (
+                    "Review the quality report and blueprint for full requirements. "
+                    "Rebuild the note from the evidence manifest and source material."
+                ),
+            }
+        )
+    elif not actions:
+        actions.append(
+            {
+                "section": "entire note",
+                "problem": "Quality report indicates minor issues that need targeted patching.",
+                "action": "patch",
+                "guidance": "Apply small targeted edits per the quality report findings.",
+            }
+        )
+
+    return actions
+
+
+def write_repair_instruction(
+    work_dir: Path,
+    key: str,
+    quality_report: dict[str, Any],
+    repair_round: int,
+    max_rounds: int,
+) -> Path:
+    """Write a structured repair-instruction JSON file for external repair agents.
+
+    Returns the path to the written file.
+    """
+    repair_level = determine_repair_level(quality_report)
+    failed_gates = _derive_failed_gates(quality_report)
+    actions = build_repair_actions(quality_report.get("repair_plan", []), repair_level)
+
+    # retry_validation lists the stages that should be re-run after the repair
+    retry_validation: list[str]
+    if repair_level == "regeneration":
+        retry_validation = ["validate", "quality", "cleanup_report"]
+    else:
+        retry_validation = ["validate", "quality"]
+
+    instruction: dict[str, Any] = {
+        "schema_version": 1,
+        "paper_key": key,
+        "repair_round": repair_round,
+        "max_rounds": max_rounds,
+        "trigger": {
+            "quality_status": quality_report.get("status", ""),
+            "failed_gates": failed_gates,
+        },
+        "repair_level": repair_level,
+        "actions": actions,
+        "retry_validation": retry_validation,
+        "created_at": _now_iso(),
+    }
+
+    instruction_path = work_dir / "reports" / f"{key}.repair-instruction.json"
+    instruction_path.parent.mkdir(parents=True, exist_ok=True)
+    instruction_path.write_text(
+        json.dumps(instruction, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    return instruction_path
+
+
+def repair_sidecar_fields(
+    round_num: int,
+    repair_level: str,
+    instruction_path: Path,
+    history: list[dict[str, Any]],
+) -> list[str]:
+    """Return --set arguments to persist repair state in the sidecar."""
+    return [
+        "--set",
+        f"repair.rounds_completed={json.dumps(round_num)}",
+        "--set",
+        f"repair.repair_level={json.dumps(repair_level)}",
+        "--set",
+        f"repair.instruction_path={json.dumps(str(instruction_path))}",
+        "--set",
+        f"repair.history={json.dumps(history, ensure_ascii=False)}",
+    ]
+
+
+# ============================================================================
+# Final delivery
+# ============================================================================
+
+
+def final_delivery_status(
+    record: dict[str, Any],
+    repair_info: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
     validation_path = first_value(record, "validation_report_path")
     quality_path = first_value(record, "quality_report_path")
     asset_path = first_value(record, "asset_report_path")
@@ -300,11 +511,26 @@ def final_delivery_status(record: dict[str, Any]) -> tuple[bool, str]:
     quality = read_json(Path(quality_path).expanduser().resolve())
     asset = read_json(Path(asset_path).expanduser().resolve())
     if validation.get("status") != "pass":
-        return False, "Validation report is not pass"
+        msg = "Validation report is not pass"
+        if repair_info and repair_info.get("rounds_completed", 0) > 0:
+            msg += (
+                f" | Unresolved repairs after {repair_info['rounds_completed']} round(s)"
+            )
+        return False, msg
     if quality.get("status") != "pass":
-        return False, f"Quality report is {quality.get('status', 'unknown')}"
+        msg = f"Quality report is {quality.get('status', 'unknown')}"
+        if repair_info and repair_info.get("rounds_completed", 0) > 0:
+            msg += (
+                f" | Unresolved repairs after {repair_info['rounds_completed']} round(s)"
+            )
+        return False, msg
     if int(asset.get("unused_assets_count", 0) or 0) and int(asset.get("image_link_count", 0) or 0) == 0:
-        return False, "Asset report has unused assets but no note image links"
+        msg = "Asset report has unused assets but no note image links"
+        if repair_info and repair_info.get("rounds_completed", 0) > 0:
+            msg += (
+                f" | Unresolved repairs after {repair_info['rounds_completed']} round(s)"
+            )
+        return False, msg
     return True, "final delivery gates passed"
 
 
@@ -316,6 +542,18 @@ def write_final_report(path: Path, summary: list[dict[str, Any]], production_mod
         if paper.get("stages", {}).get("final_delivery", {}).get("ok") is True
     )
     failed = total - passed
+    repaired = sum(
+        1
+        for paper in summary
+        if paper.get("stages", {}).get("repair", {}).get("rounds_completed", 0) > 0
+    )
+    unresolved = sum(
+        1
+        for paper in summary
+        if paper.get("stages", {}).get("repair", {}).get("rounds_completed", 0) > 0
+        and paper.get("stages", {}).get("final_delivery", {}).get("ok") is not True
+    )
+
     lines = [
         "# Batch Final Delivery Report",
         "",
@@ -323,23 +561,36 @@ def write_final_report(path: Path, summary: list[dict[str, Any]], production_mod
         f"- total_papers: {total}",
         f"- passed_final_delivery: {passed}",
         f"- failed_or_unfinished: {failed}",
+        f"- papers_with_repair_attempts: {repaired}",
+        f"- unresolved_repairs: {unresolved}",
         "",
-        "| paper_key | final | quality | validation | cleanup | note/source pack | issue |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| paper_key | final | quality | validation | repair | cleanup | note/source pack | issue |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for paper in summary:
         stages = paper.get("stages", {})
         final_stage = stages.get("final_delivery", {})
         quality = stages.get("quality", {})
         validate = stages.get("validate", {})
+        repair = stages.get("repair", {})
         cleanup = stages.get("cleanup_report", {})
         issue = paper.get("error") or final_stage.get("message") or quality.get("message") or ""
+
+        # Repair column: rounds completed or "-"
+        repair_rounds = repair.get("rounds_completed", 0)
+        if repair_rounds > 0:
+            repair_level = repair.get("repair_level", "")
+            repair_str = f"{repair_rounds}r ({repair_level})"
+        else:
+            repair_str = "-"
+
         lines.append(
-            "| {paper_key} | {final} | {quality} | {validation} | {cleanup} | {source_pack} | {issue} |".format(
+            "| {paper_key} | {final} | {quality} | {validation} | {repair} | {cleanup} | {source_pack} | {issue} |".format(
                 paper_key=paper.get("paper_key", ""),
                 final="pass" if final_stage.get("ok") else "fail",
                 quality=quality.get("status") or ("pass" if quality.get("ok") else ""),
                 validation="pass" if validate.get("ok") else "fail" if validate else "",
+                repair=repair_str,
                 cleanup="pass" if cleanup.get("ok") else "fail" if cleanup else "",
                 source_pack=paper.get("source_pack_path", ""),
                 issue=str(issue).replace("|", "\\|"),
@@ -347,6 +598,11 @@ def write_final_report(path: Path, summary: list[dict[str, Any]], production_mod
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ============================================================================
+# Stage runners
+# ============================================================================
 
 
 def source_pack_path_for(record: dict[str, Any], work_dir: Path, key: str) -> Path:
@@ -653,12 +909,26 @@ def run_asset_report(
     return True, "asset report written", report_path, report
 
 
+# ============================================================================
+# Main
+# ============================================================================
+
+
 def main() -> int:
     args = parse_args()
     requested_stages = [stage.strip() for stage in args.stages.split(",") if stage.strip()]
     unknown = [stage for stage in requested_stages if stage not in STAGES]
     if unknown:
         raise SystemExit(f"Unknown stages: {', '.join(unknown)}")
+
+    # Clamp --repair-rounds to 0-2
+    repair_rounds = max(0, min(args.repair_rounds, 2))
+    if args.repair_rounds > 2:
+        print(
+            f"Warning: --repair-rounds={args.repair_rounds} exceeds max 2; "
+            f"clamping to 2.",
+            file=sys.stderr,
+        )
 
     work_dir = Path(args.work_dir).expanduser().resolve()
     blueprint = Path(args.blueprint).expanduser().resolve() if args.blueprint else None
@@ -671,8 +941,22 @@ def main() -> int:
     for index, record in enumerate(papers, start=1):
         key = paper_key(record, index)
         sidecar = sidecar_dir / f"{key}.json"
-        paper_summary: dict[str, Any] = {"paper_key": key, "sidecar": str(sidecar), "stages": {}}
+        paper_summary: dict[str, Any] = {
+            "paper_key": key,
+            "sidecar": str(sidecar),
+            "stages": {},
+        }
         summary.append(paper_summary)
+
+        # ------------------------------------------------------------------
+        # Per-paper state for deferred failure / repair
+        # ------------------------------------------------------------------
+        quality_report_data: dict[str, Any] = {}
+        quality_failed_gate = False
+        quality_fail_message = ""
+        validate_failed = False
+        validate_fail_message = ""
+        repair_history: list[dict[str, Any]] = []
 
         try:
             source_pack = write_source_pack(record, work_dir, key)
@@ -686,20 +970,33 @@ def main() -> int:
                 ["--set", f"production_mode={json.dumps(args.production_mode)}"],
             )
 
+            # --------------------------------------------------------------
+            # preflight
+            # --------------------------------------------------------------
             if "preflight" in requested_stages:
                 ok, message = preflight(record, requested_stages)
-                update_sidecar(sidecar, record, "preflight", "complete" if ok else "failed", message)
+                update_sidecar(
+                    sidecar, record, "preflight", "complete" if ok else "failed", message
+                )
                 paper_summary["stages"]["preflight"] = {"ok": ok, "message": message}
                 if not ok:
                     raise RuntimeError(message)
 
+            # --------------------------------------------------------------
+            # parse_cache
+            # --------------------------------------------------------------
             if "parse_cache" in requested_stages:
                 ok, message = run_parse_cache_checkpoint(record)
-                update_sidecar(sidecar, record, "parse_cache", "complete" if ok else "failed", message)
+                update_sidecar(
+                    sidecar, record, "parse_cache", "complete" if ok else "failed", message
+                )
                 paper_summary["stages"]["parse_cache"] = {"ok": ok, "message": message}
                 if not ok:
                     raise RuntimeError(message)
 
+            # --------------------------------------------------------------
+            # evidence_manifest
+            # --------------------------------------------------------------
             if "evidence_manifest" in requested_stages:
                 ok, message, manifest_path = run_manifest(record, work_dir, key, source_pack)
                 extra = ["--manifest-path", str(manifest_path)] if manifest_path else []
@@ -721,13 +1018,21 @@ def main() -> int:
                 if not ok:
                     raise RuntimeError(message)
 
+            # --------------------------------------------------------------
+            # draft
+            # --------------------------------------------------------------
             if "draft" in requested_stages:
                 ok, message = run_draft_checkpoint(record)
-                update_sidecar(sidecar, record, "draft", "complete" if ok else "failed", message)
+                update_sidecar(
+                    sidecar, record, "draft", "complete" if ok else "failed", message
+                )
                 paper_summary["stages"]["draft"] = {"ok": ok, "message": message}
                 if not ok:
                     raise RuntimeError(message)
 
+            # --------------------------------------------------------------
+            # review
+            # --------------------------------------------------------------
             if "review" in requested_stages:
                 status, message = run_review_checkpoint(record)
                 update_sidecar(sidecar, record, "review", status, message)
@@ -737,20 +1042,59 @@ def main() -> int:
                     "message": message,
                 }
 
+            # --------------------------------------------------------------
+            # quality
+            # --------------------------------------------------------------
             if "quality" in requested_stages:
-                ok, message, report_path, report = run_quality(record, work_dir, key, blueprint)
-                extra = ["--quality-report-path", str(report_path)] if report_path else []
-                extra.extend(fields_to_set_args(quality_sidecar_fields(report_path)))
-                update_sidecar(sidecar, record, "quality", "complete" if ok else "failed", message, extra)
+                ok, message, report_path, report = run_quality(
+                    record, work_dir, key, blueprint
+                )
+                quality_report_data = report
+                extra_args = ["--quality-report-path", str(report_path)] if report_path else []
+                extra_args.extend(fields_to_set_args(quality_sidecar_fields(report_path)))
                 paper_summary["stages"]["quality"] = {
                     "ok": ok,
                     "message": message,
                     "quality_report_path": str(report_path) if report_path else "",
                     "status": report.get("status", "") if report else "",
                 }
-                if not ok and args.fail_on_quality_gate:
-                    raise RuntimeError(message)
 
+                if not ok and args.fail_on_quality_gate:
+                    if repair_rounds > 0:
+                        # Defer the raise --- repair loop will handle it
+                        quality_failed_gate = True
+                        quality_fail_message = message
+                        update_sidecar(
+                            sidecar,
+                            record,
+                            "quality",
+                            "failed",
+                            message,
+                            extra_args,
+                        )
+                    else:
+                        update_sidecar(
+                            sidecar,
+                            record,
+                            "quality",
+                            "failed",
+                            message,
+                            extra_args,
+                        )
+                        raise RuntimeError(message)
+                else:
+                    update_sidecar(
+                        sidecar,
+                        record,
+                        "quality",
+                        "complete" if ok else "failed",
+                        message,
+                        extra_args,
+                    )
+
+            # --------------------------------------------------------------
+            # validate
+            # --------------------------------------------------------------
             if "validate" in requested_stages:
                 ok, message, report_path = run_validation(
                     record,
@@ -760,26 +1104,135 @@ def main() -> int:
                     args.copy_map_authoritative,
                     blueprint,
                 )
-                extra = ["--validation-report-path", str(report_path)] if report_path else []
-                extra.extend(counts_to_set_args(validation_counts(report_path)))
-                extra.extend(fields_to_set_args(validation_sidecar_fields(report_path)))
-                update_sidecar(sidecar, record, "validate", "complete" if ok else "failed", message, extra)
+                extra_args = ["--validation-report-path", str(report_path)] if report_path else []
+                extra_args.extend(counts_to_set_args(validation_counts(report_path)))
+                extra_args.extend(fields_to_set_args(validation_sidecar_fields(report_path)))
                 paper_summary["stages"]["validate"] = {
                     "ok": ok,
                     "message": message,
                     "validation_report_path": str(report_path) if report_path else "",
                     "counts": validation_counts(report_path),
                 }
-                if not ok:
-                    raise RuntimeError(message)
 
+                if not ok:
+                    if repair_rounds > 0:
+                        # Defer the raise --- repair loop will handle it
+                        validate_failed = True
+                        validate_fail_message = message
+                        update_sidecar(
+                            sidecar,
+                            record,
+                            "validate",
+                            "failed",
+                            message,
+                            extra_args,
+                        )
+                    else:
+                        update_sidecar(
+                            sidecar,
+                            record,
+                            "validate",
+                            "failed",
+                            message,
+                            extra_args,
+                        )
+                        raise RuntimeError(message)
+                else:
+                    update_sidecar(
+                        sidecar,
+                        record,
+                        "validate",
+                        "complete",
+                        message,
+                        extra_args,
+                    )
+
+            # --------------------------------------------------------------
+            # repair (automatic when repair_rounds > 0 and a gate failed)
+            # --------------------------------------------------------------
+            if repair_rounds > 0 and (quality_failed_gate or validate_failed):
+                # Use the quality report if available; otherwise build a minimal
+                # report from the validation failure context.
+                qr = quality_report_data if quality_report_data else {}
+                if not qr:
+                    qr = {
+                        "status": "needs_major_repair",
+                        "repair_plan": [],
+                        "scores": {},
+                    }
+
+                repair_level = determine_repair_level(qr)
+
+                for round_num in range(1, repair_rounds + 1):
+                    instruction_path = write_repair_instruction(
+                        work_dir, key, qr, round_num, repair_rounds
+                    )
+                    entry: dict[str, Any] = {
+                        "round": round_num,
+                        "repair_level": repair_level,
+                        "instruction_path": str(instruction_path),
+                        "quality_status": qr.get("status", ""),
+                        "timestamp": _now_iso(),
+                    }
+                    repair_history.append(entry)
+
+                    # Update sidecar with repair state after each round
+                    update_sidecar(
+                        sidecar,
+                        record,
+                        "repair",
+                        "complete",
+                        (
+                            f"Repair round {round_num}/{repair_rounds} "
+                            f"instruction written ({repair_level})"
+                        ),
+                        repair_sidecar_fields(
+                            round_num, repair_level, instruction_path, repair_history
+                        ),
+                    )
+
+                paper_summary["stages"]["repair"] = {
+                    "ok": False,
+                    "rounds_completed": repair_rounds,
+                    "repair_level": repair_level,
+                    "history": repair_history,
+                    "message": (
+                        f"Repair instructions written ({repair_rounds} round(s)), "
+                        "awaiting external repair"
+                    ),
+                }
+
+                # Still raise after repair loop so the batch runner knows
+                # this paper needs attention.
+                if quality_failed_gate:
+                    raise RuntimeError(
+                        f"Quality gate failed after {repair_rounds} repair round(s): "
+                        f"{quality_fail_message}"
+                    )
+                if validate_failed:
+                    raise RuntimeError(
+                        f"Validation failed after {repair_rounds} repair round(s): "
+                        f"{validate_fail_message}"
+                    )
+
+            # If repair_rounds == 0 but flags are somehow set (should not
+            # happen because we raise inline above), raise now.
+            if repair_rounds == 0:
+                if quality_failed_gate:
+                    raise RuntimeError(quality_fail_message)
+                if validate_failed:
+                    raise RuntimeError(validate_fail_message)
+
+            # --------------------------------------------------------------
+            # cleanup_report
+            # --------------------------------------------------------------
             if "cleanup_report" in requested_stages:
                 ok, message, report_path, report = run_asset_report(
                     record, work_dir, key, args.delete_duplicate_unused
                 )
-                extra = ["--asset-report-path", str(report_path)] if report_path else []
+                extra_args = ["--asset-report-path", str(report_path)] if report_path else []
                 if report:
-                    extra.extend(
+                    extra_args.extend(
                         [
                             "--set",
                             f"counts.image_link_count={report.get('image_link_count', 0)}",
@@ -793,14 +1246,14 @@ def main() -> int:
                             f"counts.duplicate_hash_count={report.get('duplicate_hash_count', 0)}",
                         ]
                     )
-                    extra.extend(fields_to_set_args(asset_sidecar_fields(report)))
+                    extra_args.extend(fields_to_set_args(asset_sidecar_fields(report)))
                 update_sidecar(
                     sidecar,
                     record,
                     "cleanup_report",
                     "complete" if ok else "failed",
                     message,
-                    extra,
+                    extra_args,
                 )
                 paper_summary["stages"]["cleanup_report"] = {
                     "ok": ok,
@@ -818,8 +1271,14 @@ def main() -> int:
                 if not ok:
                     raise RuntimeError(message)
 
+            # --------------------------------------------------------------
+            # final_delivery
+            # --------------------------------------------------------------
             if "final_delivery" in requested_stages:
-                ok, message = final_delivery_status(record)
+                repair_info: dict[str, Any] = {
+                    "rounds_completed": len(repair_history),
+                }
+                ok, message = final_delivery_status(record, repair_info)
                 update_sidecar(
                     sidecar,
                     record,
@@ -828,7 +1287,10 @@ def main() -> int:
                     message,
                     ["--set", f"final_status={json.dumps('pass' if ok else 'fail')}"],
                 )
-                paper_summary["stages"]["final_delivery"] = {"ok": ok, "message": message}
+                paper_summary["stages"]["final_delivery"] = {
+                    "ok": ok,
+                    "message": message,
+                }
                 if not ok:
                     raise RuntimeError(message)
         except Exception as exc:

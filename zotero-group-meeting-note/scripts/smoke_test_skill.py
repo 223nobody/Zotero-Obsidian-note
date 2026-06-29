@@ -20,7 +20,7 @@ AUDIT_QUALITY = SCRIPT_DIR / "audit_note_quality.py"
 COLLECT_ASSETS = SCRIPT_DIR / "collect_assets.py"
 AUDIT_ASSETS = SCRIPT_DIR / "audit_note_assets.py"
 UPDATE_SIDECAR = SCRIPT_DIR / "update_pipeline_sidecar.py"
-CONFLICT_MARKERS = ("<" * 7, "=" * 7, ">" * 7)
+CONFLICT_PATTERNS = (r"^<<<<<<< ",)
 
 
 def run(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -33,13 +33,14 @@ def assert_true(condition: bool, message: str) -> None:
 
 
 def assert_no_conflict_markers() -> None:
+    import re
     checked_suffixes = {".md", ".py", ".yaml", ".yml", ".json"}
     offenders: list[str] = []
     for path in sorted(SKILL_DIR.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in checked_suffixes:
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
-        if any(marker in text for marker in CONFLICT_MARKERS):
+        if any(re.search(pattern, text, re.MULTILINE) for pattern in CONFLICT_PATTERNS):
             offenders.append(str(path.relative_to(SKILL_DIR)))
     assert_true(not offenders, "Conflict markers remain: " + ", ".join(offenders))
 

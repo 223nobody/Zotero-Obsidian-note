@@ -63,16 +63,35 @@ def sections(text: str) -> list[dict[str, Any]]:
     for index, row in enumerate(rows):
         row["end"] = rows[index + 1]["start"] if index + 1 < len(rows) else len(text)
         row["body"] = text[row["start"] : row["end"]]
+        row["children"] = []
+    # Build parent-child relationships: a heading "owns" subsequent higher-level headings
+    for i, row in enumerate(rows):
+        for j in range(i + 1, len(rows)):
+            if rows[j]["level"] > row["level"]:
+                row["children"].append(rows[j])
+            else:
+                break
     return rows
+
+
+def section_body_with_children(row: dict[str, Any]) -> str:
+    """Return a section's body including all child sub-sections."""
+    body = row.get("body", "")
+    for child in row.get("children", []):
+        body += child.get("body", "")
+    return body
 
 
 def section_by_keywords(rows: list[dict[str, Any]], *keywords: str) -> dict[str, Any] | None:
     lowered = [keyword.lower() for keyword in keywords]
+    # Prefer H2 matches over deeper levels
+    best: dict[str, Any] | None = None
     for row in rows:
         title = str(row["title"]).lower()
         if any(keyword in title for keyword in lowered):
-            return row
-    return None
+            if best is None or row["level"] < best["level"]:
+                best = row
+    return best
 
 
 def score_length(body: str, minimum: int) -> float:
@@ -164,13 +183,13 @@ def audit(note_path: Path, source_pack: str | None, manifest_path: str | None, b
 
     scores = {
         "blueprint_structure": 1.0 if len([row for row in rows if row["level"] <= 2]) >= 6 else 0.35,
-        "core_conclusion": score_length(conclusion.get("body", "") if conclusion else "", 220),
-        "problem_positioning": score_length(problem.get("body", "") if problem else "", 260),
-        "innovation_analysis": score_length(innovation.get("body", "") if innovation else "", 300),
-        "method_explanation": score_length(method.get("body", "") if method else "", 320),
-        "evidence_depth": score_length(evidence.get("body", "") if evidence else "", 420),
-        "related_work": score_length(related.get("body", "") if related else "", 220),
-        "limitations_discussion": score_length(limitation.get("body", "") if limitation else "", 260),
+        "core_conclusion": score_length(section_body_with_children(conclusion) if conclusion else "", 220),
+        "problem_positioning": score_length(section_body_with_children(problem) if problem else "", 260),
+        "innovation_analysis": score_length(section_body_with_children(innovation) if innovation else "", 300),
+        "method_explanation": score_length(section_body_with_children(method) if method else "", 320),
+        "evidence_depth": score_length(section_body_with_children(evidence) if evidence else "", 420),
+        "related_work": score_length(section_body_with_children(related) if related else "", 220),
+        "limitations_discussion": score_length(section_body_with_children(limitation) if limitation else "", 260),
         "terminology": 0.75 if re.search(r"[A-Za-z][A-Za-z -]{3,}\s*[（(]", text) else 0.5,
     }
 
@@ -193,7 +212,7 @@ def audit(note_path: Path, source_pack: str | None, manifest_path: str | None, b
     if not limitation:
         add_repair(repair_plan, "limitations/discussion", "No recognizable limitations/discussion section.", "minor")
 
-    evidence_body = evidence.get("body", "") if evidence else ""
+    evidence_body = section_body_with_children(evidence) if evidence else ""
     label_count = len(EVIDENCE_LABEL_RE.findall(evidence_body))
     if evidence and label_count < max(1, min(3, manifest_stats(manifest_path).get("required_items", 1))):
         add_repair(
