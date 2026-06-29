@@ -181,19 +181,27 @@ def check_skill_note(text: str) -> dict[str, Any]:
     }
 
     # Check 4: innovation scoped to lifecycle stage
+    # Collect all sections whose headings mention innovation/method/design/system keywords
     innovation_section = ""
-    for match in re.finditer(
-        r"(?:^#{2,3}\s*(?:三|四|[34]\.|[IVX]+\.)\s*(?:创新|方法|机制|系统|设计).*$)",
-        text, re.MULTILINE
-    ):
-        start = match.start()
-        next_h2 = re.search(r"^#{2}\s", text[start + 1:], re.MULTILINE)
-        end = start + 1 + next_h2.start() if next_h2 else len(text)
-        innovation_section += text[start:end]
+    innovation_headings_found = 0
+    innovation_keywords = [
+        r"创新", r"方法", r"机制", r"系统", r"设计",
+        r"innovation", r"method", r"system", r"design", r"mechanism",
+        r"贡献", r"contribution", r"架构", r"architecture", r"pipeline",
+    ]
+    heading_pattern = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
+    for m in heading_pattern.finditer(text):
+        title = m.group(2).lower()
+        if any(kw in title for kw in innovation_keywords):
+            start = m.start()
+            next_h2 = re.search(r"^#{1,2}\s", text[start + m.end() - m.start():], re.MULTILINE)
+            end = start + m.end() - m.start() + next_h2.start() if next_h2 else len(text)
+            innovation_section += text[start:end]
+            innovation_headings_found += 1
 
     checks["innovation_scoped"] = {
-        "pass": len(innovation_section) > 100,
-        "evidence": f"创新/方法章节内容长度: {len(innovation_section)} 字符",
+        "pass": innovation_headings_found >= 1 and len(innovation_section) > 100,
+        "evidence": f"发现 {innovation_headings_found} 个创新/方法相关标题，章节内容总长度: {len(innovation_section)} 字符",
     }
 
     # Check 5: evidence mapped
