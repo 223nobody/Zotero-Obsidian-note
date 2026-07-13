@@ -140,6 +140,16 @@ def parse_args() -> argparse.Namespace:
         "--copy-map",
         help="Optional JSON path for the manifest asset copy map used by drafting/validation.",
     )
+    parser.add_argument(
+        "--dedupe-by-hash",
+        choices=["global", "stem", "none"],
+        default="global",
+        help=(
+            "How copied assets are reused by SHA256. 'global' reuses any existing same-hash "
+            "file in assets/; 'stem' reuses only matching generated stems; 'none' disables "
+            "hash reuse. Default: global."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -417,24 +427,64 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def existing_asset_by_hash(
-    assets_dir: Path, source_hash: str, preferred_stem: str | None = None
-) -> Path | None:
-    if not source_hash or not assets_dir.is_dir():
-        return None
+def asset_hash_index(assets_dir: Path) -> dict[str, list[Path]]:
+    index: dict[str, list[Path]] = {}
+    if not assets_dir.is_dir():
+        return index
     for candidate in sorted(assets_dir.iterdir()):
         if not candidate.is_file():
             continue
-        if preferred_stem and not (
-            candidate.stem == preferred_stem or candidate.stem.startswith(f"{preferred_stem}-")
-        ):
-            continue
         try:
-            if file_sha256(candidate) == source_hash:
-                return candidate
+            index.setdefault(file_sha256(candidate), []).append(candidate)
         except OSError:
             continue
-    return None
+    return index
+
+
+def choose_existing_asset(
+    candidates: list[Path], preferred_stem: str | None = None
+) -> Path | None:
+    if not candidates:
+        return None
+    if preferred_stem:
+        for candidate in candidates:
+            if candidate.stem == preferred_stem or candidate.stem.startswith(f"{preferred_stem}-"):
+                return candidate
+    return sorted(candidates, key=lambda path: (len(path.name), path.name.lower()))[0]
+
+
+def existing_asset_by_hash(
+    assets_dir: Path,
+    source_hash: str,
+    preferred_stem: str | None = None,
+    *,
+    mode: str = "global",
+    hash_index: dict[str, list[Path]] | None = None,
+) -> Path | None:
+    if not source_hash or mode == "none":
+        return None
+    if mode not in {"global", "stem"}:
+        raise ValueError(f"Unsupported hash dedupe mode: {mode}")
+    index = hash_index if hash_index is not None else asset_hash_index(assets_dir)
+    candidates = index.get(source_hash, [])
+    if mode == "stem":
+        candidates = [
+            candidate
+            for candidate in candidates
+            if preferred_stem
+            and (candidate.stem == preferred_stem or candidate.stem.startswith(f"{preferred_stem}-"))
+        ]
+    return choose_existing_asset(candidates, preferred_stem)
+
+
+def copy_action_for_reuse(destination: Path | None, preferred_stem: str | None, mode: str) -> str:
+    if destination is None:
+        return "copied"
+    if mode == "global" and preferred_stem and not (
+        destination.stem == preferred_stem or destination.stem.startswith(f"{preferred_stem}-")
+    ):
+        return "reused_by_global_hash"
+    return "reused"
 
 
 def iter_asset_files(files: Iterable[str], dirs: Iterable[str]) -> list[Path]:
@@ -453,19 +503,32 @@ def iter_asset_files(files: Iterable[str], dirs: Iterable[str]) -> list[Path]:
     return result
 
 
-def copy_assets(asset_files: list[Path], assets_dir: Path) -> list[dict[str, str]]:
+def copy_assets(
+    asset_files: list[Path],
+    assets_dir: Path,
+    *,
+    dedupe_by_hash: str = "global",
+) -> list[dict[str, str]]:
     copied: list[dict[str, str]] = []
     assets_dir.mkdir(parents=True, exist_ok=True)
+    hash_index = asset_hash_index(assets_dir)
 
     for source in asset_files:
         safe_name = sanitize_filename_part(source.stem, max_chars=70) + source.suffix.lower()
         source_hash = file_sha256(source)
         preferred_stem = Path(safe_name).stem
-        destination = existing_asset_by_hash(assets_dir, source_hash, preferred_stem)
-        copy_action = "reused" if destination else "copied"
+        destination = existing_asset_by_hash(
+            assets_dir,
+            source_hash,
+            preferred_stem,
+            mode=dedupe_by_hash,
+            hash_index=hash_index,
+        )
+        copy_action = copy_action_for_reuse(destination, preferred_stem, dedupe_by_hash)
         if destination is None:
             destination = unique_destination(assets_dir / safe_name)
             shutil.copy2(source, destination)
+            hash_index.setdefault(source_hash, []).append(destination)
         copied.append(
             {
                 "source": str(source),
@@ -496,8 +559,16 @@ def resolve_manifest_asset_path(raw_path: object, manifest_data: dict[str, Any],
             [
                 assets_root / path_text,
                 assets_root / path.name,
+                assets_root / "figures" / path.name,
+                assets_root / "tables" / path.name,
+                assets_root / "equations" / path.name,
+                assets_root / "images" / path.name,
                 assets_root.parent / path_text,
                 assets_root.parent / path.name,
+                assets_root.parent / "figures" / path.name,
+                assets_root.parent / "tables" / path.name,
+                assets_root.parent / "equations" / path.name,
+                assets_root.parent / "images" / path.name,
             ]
         )
     candidates.extend([manifest_dir / path_text, manifest_dir / path.name])
@@ -510,7 +581,13 @@ def resolve_manifest_asset_path(raw_path: object, manifest_data: dict[str, Any],
     return path.resolve()
 
 
-def sync_assets_from_manifest(manifest_path: str, assets_dir: Path, article_name: str) -> list[dict[str, str]]:
+def sync_assets_from_manifest(
+    manifest_path: str,
+    assets_dir: Path,
+    article_name: str,
+    *,
+    dedupe_by_hash: str = "global",
+) -> list[dict[str, str]]:
     """Copy high/medium-confidence matched assets from a manifest into the assets dir.
 
     Files are renamed as kind-number-paper-topic stems such as
@@ -518,6 +595,9 @@ def sync_assets_from_manifest(manifest_path: str, assets_dir: Path, article_name
     appending a counter.
     """
     copied: list[dict[str, str]] = []
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    hash_index = asset_hash_index(assets_dir)
+    source_hash_destinations: dict[str, Path] = {}
     manifest_file = Path(manifest_path).expanduser().resolve()
     manifest_data = read_json(manifest_file)
     manifest_dir = manifest_file.parent
@@ -552,11 +632,29 @@ def sync_assets_from_manifest(manifest_path: str, assets_dir: Path, article_name
                 len(asset_paths),
             )
             source_hash = file_sha256(source)
-            destination = existing_asset_by_hash(assets_dir, source_hash, safe_stem)
-            copy_action = "reused" if destination else "copied"
+            destination = (
+                source_hash_destinations.get(source_hash)
+                if dedupe_by_hash == "global"
+                else None
+            )
+            if destination is None:
+                destination = existing_asset_by_hash(
+                    assets_dir,
+                    source_hash,
+                    safe_stem,
+                    mode=dedupe_by_hash,
+                    hash_index=hash_index,
+                )
+            copy_action = copy_action_for_reuse(destination, safe_stem, dedupe_by_hash)
             if destination is None:
                 destination = unique_destination(assets_dir / f"{safe_stem}{suffix}")
                 shutil.copy2(source, destination)
+                hash_index.setdefault(source_hash, []).append(destination)
+                if dedupe_by_hash == "global":
+                    source_hash_destinations[source_hash] = destination
+            else:
+                if dedupe_by_hash == "global":
+                    source_hash_destinations.setdefault(source_hash, destination)
             destination_hash = file_sha256(destination)
             copied.append(
                 {
@@ -573,6 +671,9 @@ def sync_assets_from_manifest(manifest_path: str, assets_dir: Path, article_name
                     "page": str(item.get("page", "")),
                     "asset_index": str(asset_index),
                     "copy_action": copy_action,
+                    "canonical_by_sha256": "true"
+                    if copy_action == "reused_by_global_hash"
+                    else "false",
                 }
             )
 
@@ -659,13 +760,16 @@ def main() -> int:
             obsidian_note_path, note_title, args.create_note_stubs, args.overwrite_stubs
         )
         copied_assets = copy_assets(
-            iter_asset_files(args.asset, args.asset_dir), obsidian_assets_dir
+            iter_asset_files(args.asset, args.asset_dir),
+            obsidian_assets_dir,
+            dedupe_by_hash=args.dedupe_by_hash,
         )
         if args.sync_from_manifest:
             manifest_copied = sync_assets_from_manifest(
                 args.sync_from_manifest,
                 obsidian_assets_dir,
                 article_name,
+                dedupe_by_hash=args.dedupe_by_hash,
             )
             copied_assets.extend(manifest_copied)
         if args.copy_map:

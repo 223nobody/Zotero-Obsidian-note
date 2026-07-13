@@ -17,7 +17,12 @@ Review the draft against the paper, extracted Markdown, existing note, and `refe
 - Check that `## 五、图表公式解释` mixes Figure / Table / Equation / Loss / Objective / Score / Constraint entries by the original paper's first-appearance order.
 - Check that each Figure / Table / Equation entry uses the matched local `assets/...` image or formula/table crop when available, and that the image appears under the correct entry rather than in a generic resource appendix.
 - If the source came from `paper-search-mcp`, check asset binding against `content_list.json` and `get_paper_assets` / `assets_dir`, not only against Markdown proximity. Treat `assets_dir` as a candidate pool; do not fail the note merely because unrelated or duplicate parser crops are absent from the final text.
+- If `scripts/audit_unmatched_assets.py` reports formula-looking orphan crops or structured figure panels missing from the final assets, repair the evidence manifest and note before style polishing. Do not accept a pass from `audit_note_assets.py` alone when source-side formula/panel assets are missing.
 - Check that high/medium-confidence manifest rows with matched assets appear in the corresponding final-note evidence entries, unless the row was intentionally corrected after source review.
+- Check that formula entries explain the formula image or LaTeX, variables, optimization/selection intuition, relation to method claims, relation to a table/ablation/result when available, and the evidence boundary. A single sentence such as "this is the training loss" is not enough for a final note.
+- Check that math-like symbols are not written as inline code. Use `$...$` or `$$...$$` for variables, Greek letters, subscripts/superscripts, capability functions, constraints, objectives, and relations such as `\pi_j`, `c_i`, `\Phi(c_i)`, `x_{s,v}`, `Cap_I(s)`, or `NONE \sqsubseteq READ`; keep backticks only for real code, paths, commands, APIs, filenames, and data fields.
+- Check that repeated Figure/Table/Equation templates have not turned into a rigid skeleton. Keep the fixed note structure, but rewrite core evidence entries as item-specific evidence narratives when the template headings make the content shallow or repetitive.
+- Check that every core Figure/Table/Equation explanation reads as an evidence narrative: what the item shows, which claim it supports, how it connects to the method/result chain, and what it cannot prove. Caption restatement or one-sentence formula/table summaries must fail review.
 - If the draft contains `## 附录：MinerU 图片资源完整性索引`, `MinerU asset`, `MinerU extra crop`, or a filename-only list of `assets/...` images, treat this as a failed review. Delete the asset-audit section. Move any genuinely relevant image into its matching Figure / Table / Equation / Prompt / Case Study entry; keep all other unmatched assets out of the final note or, when explicitly needed, in a separate manifest/checklist file.
 - Check that Obsidian wiki embeds such as `![[Pasted image ...]]` have been copied into the note's `assets/` folder and rewritten as relative Markdown links unless the user explicitly wants vault-global links.
 - Check that material after References/Bibliography is not mixed into the main evidence timeline. If it contains Appendix, Supplementary Material, prompts, case studies, implementation details, checklists, or extra figures/tables/equations, put it under `## 八、参考文献后内容与补充材料`. Do the same for appendix/supplementary material before References when it is clearly outside the main-paper argument.
@@ -63,6 +68,9 @@ Check these gates in order:
 - `evidence_coverage`: required Figure / Table / Equation / Algorithm / Prompt / Case evidence from the manifest is present, ordered correctly, and explained rather than caption-repeated.
 - `asset_status`: all final note image links are note-local `assets/...`, matched images sit beside the evidence they support, and no MinerU asset dump appears in the note body.
 - `content_depth`: core conclusion, problem positioning, innovation, mechanism, results, related work, limitations, and discussion are substantive enough for a group meeting.
+- `math_format`: math-like symbols are rendered as LaTeX math, not inline code spans.
+- `formula_depth`: core formulas include image/LaTeX, symbol explanation, objective/constraint intuition, claim/result connection, and boundary.
+- `evidence_narrative`: core figures, tables, formulas, prompts, and cases are explained as item-specific evidence rather than caption restatements or rigid template fill-ins.
 - `domain_consistency`: the note correctly treats the paper as method/system/survey/benchmark/security/etc. and reads the matching domain reference when available.
 - `terminology`: recurring technical English phrases have stable inline Chinese explanations at first important mention.
 
@@ -109,6 +117,10 @@ Before delivery, confirm:
 - Core figures, tables, formulas, and conclusion numbers are all covered.
 - The unified figure/table/formula evidence timeline follows the original paper order.
 - Matched images, tables, and equation crops are placed beside the evidence entries they belong to.
+- Multi-panel evidence items include every required panel image locally, not only one representative crop.
+- Formula/equation/loss entries include variable explanation, objective intuition, evidence connection, and boundary.
+- Math variables, formula functions, constraints, and relations are not wrapped in backticks unless they are literal code identifiers.
+- Core evidence entries are not merely template headings filled with generic sentences; they contain item-specific mechanism, metric, claim, and boundary analysis.
 - Every final note image link resolves to a file in the note-local `assets/` folder, especially for images copied from MCP `assets_dir`.
 - The final note contains no MinerU image resource-completeness appendix and no raw asset dump.
 - `scripts/validate_note.py <note-path>` passes, or every remaining error is explicitly reported.

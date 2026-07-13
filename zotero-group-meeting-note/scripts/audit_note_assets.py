@@ -63,6 +63,16 @@ def parse_args() -> argparse.Namespace:
         "--vault-root",
         help="Optional Obsidian vault root used to resolve wiki embeds.",
     )
+    parser.add_argument(
+        "--fail-on-duplicates",
+        action="store_true",
+        help="Exit non-zero when assets_dir contains duplicate SHA256 groups after optional cleanup.",
+    )
+    parser.add_argument(
+        "--fail-on-unused",
+        action="store_true",
+        help="Exit non-zero when assets_dir contains unused assets after optional cleanup.",
+    )
     return parser.parse_args()
 
 
@@ -227,6 +237,8 @@ def build_report(
     ]
 
     return {
+        "schema_version": 2,
+        "report_type": "asset",
         "note": str(note_path),
         "assets_dir": str(assets_dir),
         "image_link_count": len(links),
@@ -302,12 +314,24 @@ def main() -> int:
     else:
         report["deleted_assets"] = []
     report["skipped_delete_paths"] = skipped_delete_paths
+    failed_gates: list[str] = []
+    if args.fail_on_duplicates and int(report.get("duplicate_hash_count", 0)) > 0:
+        failed_gates.append("duplicate_asset_hashes")
+    if args.fail_on_unused and int(report.get("unused_assets_count", 0)) > 0:
+        failed_gates.append("unused_assets")
+    report["failed_gates"] = failed_gates
+    report["problem_count"] = len(failed_gates)
+    report["status"] = "fail" if failed_gates else "pass"
+    report["ok"] = not failed_gates
 
     output = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
         Path(args.output).expanduser().resolve().write_text(output + "\n", encoding="utf-8")
     else:
         print(output)
+    if failed_gates:
+        print("asset audit failed gates: " + ", ".join(failed_gates), file=sys.stderr)
+        return 1
     return 0
 
 

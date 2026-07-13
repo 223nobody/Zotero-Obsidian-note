@@ -72,11 +72,27 @@ def main() -> int:
         item for item in payload.get("warnings", []) if item.get("kind") in evidence_kinds
     ]
     report = {
+        "schema_version": 2,
         "note": payload.get("note", str(Path(args.note).expanduser().resolve())),
         "manifest": str(Path(args.evidence_manifest).expanduser().resolve()),
         "status": "pass" if not evidence_errors and not (args.strict and evidence_warnings) else "fail",
         "errors": evidence_errors,
         "warnings": evidence_warnings,
+        "missing_required_items": [
+            item.get("message", "")
+            for item in evidence_errors + evidence_warnings
+            if item.get("kind") in {"missing_required_evidence", "missing_evidence_reference"}
+        ],
+        "misplaced_items": [
+            item.get("message", "")
+            for item in evidence_errors + evidence_warnings
+            if item.get("kind") == "misplaced_evidence_asset_link"
+        ],
+        "order_violations": [
+            item.get("message", "")
+            for item in evidence_errors + evidence_warnings
+            if item.get("kind") == "evidence_order_error"
+        ],
         "all_validation_status": payload.get("status", ""),
     }
 

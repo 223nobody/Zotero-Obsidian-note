@@ -8,6 +8,7 @@ state around drafting so a Codex run can resume paper-by-paper.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -20,16 +21,20 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 BUILD_MANIFEST = SCRIPT_DIR / "build_evidence_manifest.py"
 VALIDATE_NOTE = SCRIPT_DIR / "validate_note.py"
 AUDIT_QUALITY = SCRIPT_DIR / "audit_note_quality.py"
+VALIDATE_DOMAIN = SCRIPT_DIR / "validate_domain_consistency.py"
 AUDIT_ASSETS = SCRIPT_DIR / "audit_note_assets.py"
+AUDIT_UNMATCHED_ASSETS = SCRIPT_DIR / "audit_unmatched_assets.py"
 UPDATE_SIDECAR = SCRIPT_DIR / "update_pipeline_sidecar.py"
 
 STAGES = [
     "preflight",
     "parse_cache",
     "evidence_manifest",
+    "domain_precheck",
     "draft",
     "review",
     "quality",
+    "domain",
     "validate",
     "repair",
     "cleanup_report",
@@ -106,9 +111,24 @@ def parse_args() -> argparse.Namespace:
         help="Treat non-pass quality reports as batch failures.",
     )
     parser.add_argument(
+        "--fail-on-domain-gate",
+        action="store_true",
+        help="Treat non-pass domain consistency reports as batch failures.",
+    )
+    parser.add_argument(
         "--delete-duplicate-unused",
         action="store_true",
         help="When running cleanup_report, delete unused duplicate assets after reporting.",
+    )
+    parser.add_argument(
+        "--fail-on-duplicate-assets",
+        action="store_true",
+        help="When running cleanup_report, fail the stage if duplicate asset SHA256 groups remain.",
+    )
+    parser.add_argument(
+        "--fail-on-unmatched-assets",
+        action="store_true",
+        help="When running cleanup_report, fail if source MinerU formula/panel assets are missing from final assets.",
     )
     parser.add_argument(
         "--strict-evidence",
@@ -145,6 +165,16 @@ def run(command: list[str]) -> subprocess.CompletedProcess[str]:
 
 def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8-sig", errors="ignore"))
+
+
+def file_sha256(path: Path | None) -> str:
+    if not path or not path.is_file():
+        return ""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def load_batch(path: Path) -> list[dict[str, Any]]:
@@ -266,11 +296,43 @@ def quality_sidecar_fields(report_path: Path | None) -> dict[str, Any]:
             "status": report.get("status", ""),
             "report_path": str(report_path),
             "repair_plan_count": len(report.get("repair_plan", [])),
+            "failed_gates": report.get("failed_gates", []),
+            "failed_items": report.get("failed_items", []),
+            "repair_scope": report.get("repair_scope", ""),
             "scores": report.get("scores", {}),
         },
         "review_items": [
             {
                 "section": item.get("section", ""),
+                "problem": item.get("problem", ""),
+                "repair_level": item.get("repair_level", ""),
+            }
+            for item in report.get("repair_plan", [])
+        ],
+    }
+
+
+def domain_sidecar_fields(report_path: Path | None) -> dict[str, Any]:
+    if not report_path or not report_path.is_file():
+        return {}
+    report = read_json(report_path)
+    return {
+        "domain": {
+            "status": report.get("status", ""),
+            "report_path": str(report_path),
+            "detected_domain": report.get("detected_domain", ""),
+            "detected_paper_type": report.get("detected_paper_type", ""),
+            "paper_type_candidate": report.get("paper_type_candidate", ""),
+            "domain_confidence": report.get("domain_confidence", 0),
+            "paper_type_confidence": report.get("paper_type_confidence", 0),
+            "failed_gates": report.get("failed_gates", []),
+            "conflict_fields": report.get("conflict_fields", []),
+            "failed_checks": report.get("summary", {}).get("failed_checks", 0),
+            "total_checks": report.get("summary", {}).get("total_checks", 0),
+        },
+        "review_items": [
+            {
+                "section": f"domain:{item.get('check', '')}",
                 "problem": item.get("problem", ""),
                 "repair_level": item.get("repair_level", ""),
             }
@@ -325,6 +387,65 @@ def determine_repair_level(quality_report: dict[str, Any]) -> str:
     return _QUALITY_STATUS_REPAIR_MAP.get(status, "major")
 
 
+def merge_repair_reports(*reports: dict[str, Any]) -> dict[str, Any]:
+    """Merge quality/domain/validation-like reports into one repair context."""
+    merged: dict[str, Any] = {
+        "status": "pass",
+        "repair_plan": [],
+        "failed_items": [],
+        "failed_gates": [],
+        "scores": {},
+        "source_reports": [],
+        "repair_scope": "",
+    }
+    rank = {
+        "pass": 0,
+        "needs_minor_repair": 1,
+        "needs_major_repair": 2,
+        "needs_regeneration": 3,
+    }
+    worst_rank = 0
+    for index, report in enumerate(reports, start=1):
+        if not report:
+            continue
+        status = str(report.get("status", "") or "needs_major_repair")
+        worst_rank = max(worst_rank, rank.get(status, 2))
+        label = report.get("label") or report.get("report_type") or f"report_{index}"
+        merged["source_reports"].append(
+            {
+                "label": label,
+                "status": status,
+                "path": report.get("report_path", ""),
+            }
+        )
+        for gate in report.get("failed_gates", []):
+            gate_text = str(gate)
+            if gate_text not in merged["failed_gates"]:
+                merged["failed_gates"].append(gate_text)
+        for key, value in report.get("scores", {}).items():
+            merged["scores"][key] = value
+        for item in report.get("repair_plan", []):
+            copied = dict(item)
+            if "section" not in copied and "check" in copied:
+                copied["section"] = f"domain:{copied.get('check', '')}"
+            copied.setdefault("problem", "")
+            copied.setdefault("repair_level", "major" if status != "needs_minor_repair" else "minor")
+            copied.setdefault("source_report", label)
+            merged["repair_plan"].append(copied)
+        for item in report.get("failed_items", []):
+            if isinstance(item, dict):
+                copied_item = dict(item)
+                copied_item.setdefault("source_report", label)
+                merged["failed_items"].append(copied_item)
+        if report.get("repair_scope") and not merged["repair_scope"]:
+            merged["repair_scope"] = report.get("repair_scope")
+    for status, value in rank.items():
+        if value == worst_rank:
+            merged["status"] = status
+            break
+    return merged
+
+
 def _derive_failed_gates(quality_report: dict[str, Any]) -> list[str]:
     """Extract likely failed gates from the quality report."""
     gates: list[str] = []
@@ -368,6 +489,28 @@ def build_repair_actions(
     else:
         action_kind = "rewrite"
 
+    def guidance_for_item(section: str, problem: str) -> str:
+        lower = f"{section} {problem}".lower()
+        if "math" in lower and "format" in lower:
+            return (
+                "Patch math-like inline code spans only: convert variables, Greek letters, "
+                "subscripts/superscripts, constraints, and formula functions to `$...$` or `$$...$$`; "
+                "keep real code, paths, commands, filenames, APIs, and data fields in backticks."
+            )
+        if "formula" in lower or "equation" in lower:
+            return (
+                "Rewrite the affected Equation/Loss/Objective entries from the source pack and evidence manifest. "
+                "Include formula image or LaTeX, symbol explanations, objective/constraint intuition, method/result "
+                "connection, and boundary. Do not stop at a one-sentence formula caption."
+            )
+        if "evidence" in lower or "caption" in lower or "template" in lower:
+            return (
+                "Rewrite the affected Figure/Table/Prompt/Case entries as item-specific evidence narratives. "
+                "For figures, explain mechanism, elements, claim link, and boundary. For tables, explain setting, "
+                "metrics, strongest baselines, gains, costs, fairness, and conclusion strength."
+            )
+        return problem
+
     for item in repair_plan:
         section = item.get("section", "")
         problem = item.get("problem", "")
@@ -388,7 +531,7 @@ def build_repair_actions(
                 "section": section,
                 "problem": problem,
                 "action": verb,
-                "guidance": problem,
+                "guidance": guidance_for_item(str(section), str(problem)),
             }
         )
 
@@ -418,6 +561,35 @@ def build_repair_actions(
     return actions
 
 
+def build_failed_item_actions(
+    failed_items: list[dict[str, Any]],
+    repair_scope: str,
+) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    for item in failed_items:
+        gate = str(item.get("gate", ""))
+        label = str(item.get("display_label") or item.get("item_key") or "")
+        missing_slots = item.get("missing_slots", [])
+        verb = "patch" if repair_scope == "item_patch" else "rewrite"
+        if item.get("repair_level") == "regeneration" or repair_scope == "regeneration":
+            verb = "regenerate"
+        actions.append(
+            {
+                "section": item.get("display_label") or item.get("item_key") or "evidence item",
+                "item_key": item.get("item_key", ""),
+                "display_label": label,
+                "gate": gate,
+                "missing_slots": missing_slots,
+                "problem": item.get("required_action", ""),
+                "action": verb,
+                "guidance": item.get("repair_hint") or item.get("required_action", ""),
+                "current_excerpt": item.get("current_excerpt", ""),
+                "source_context": item.get("source_context", ""),
+            }
+        )
+    return actions
+
+
 def write_repair_instruction(
     work_dir: Path,
     key: str,
@@ -431,7 +603,12 @@ def write_repair_instruction(
     """
     repair_level = determine_repair_level(quality_report)
     failed_gates = _derive_failed_gates(quality_report)
-    actions = build_repair_actions(quality_report.get("repair_plan", []), repair_level)
+    repair_scope = str(quality_report.get("repair_scope") or "")
+    item_actions = build_failed_item_actions(
+        list(quality_report.get("failed_items", [])),
+        repair_scope,
+    )
+    actions = item_actions + build_repair_actions(quality_report.get("repair_plan", []), repair_level)
 
     # retry_validation lists the stages that should be re-run after the repair
     retry_validation: list[str]
@@ -439,6 +616,8 @@ def write_repair_instruction(
         retry_validation = ["validate", "quality", "cleanup_report"]
     else:
         retry_validation = ["validate", "quality"]
+    if any(str(gate).startswith("domain") for gate in failed_gates) and "domain" not in retry_validation:
+        retry_validation.append("domain")
 
     instruction: dict[str, Any] = {
         "schema_version": 1,
@@ -450,6 +629,7 @@ def write_repair_instruction(
             "failed_gates": failed_gates,
         },
         "repair_level": repair_level,
+        "repair_scope": repair_scope or ("regeneration" if repair_level == "regeneration" else "section_patch"),
         "actions": actions,
         "retry_validation": retry_validation,
         "created_at": _now_iso(),
@@ -495,12 +675,14 @@ def final_delivery_status(
 ) -> tuple[bool, str]:
     validation_path = first_value(record, "validation_report_path")
     quality_path = first_value(record, "quality_report_path")
+    domain_path = first_value(record, "domain_report_path")
     asset_path = first_value(record, "asset_report_path")
     missing = [
         name
         for name, value in {
             "validation_report_path": validation_path,
             "quality_report_path": quality_path,
+            "domain_report_path": domain_path,
             "asset_report_path": asset_path,
         }.items()
         if not value or not Path(value).expanduser().is_file()
@@ -509,6 +691,7 @@ def final_delivery_status(
         return False, "Missing final delivery reports: " + ", ".join(missing)
     validation = read_json(Path(validation_path).expanduser().resolve())
     quality = read_json(Path(quality_path).expanduser().resolve())
+    domain = read_json(Path(domain_path).expanduser().resolve())
     asset = read_json(Path(asset_path).expanduser().resolve())
     if validation.get("status") != "pass":
         msg = "Validation report is not pass"
@@ -524,6 +707,13 @@ def final_delivery_status(
                 f" | Unresolved repairs after {repair_info['rounds_completed']} round(s)"
             )
         return False, msg
+    if domain.get("status") != "pass":
+        msg = f"Domain report is {domain.get('status', 'unknown')}"
+        if repair_info and repair_info.get("rounds_completed", 0) > 0:
+            msg += (
+                f" | Unresolved repairs after {repair_info['rounds_completed']} round(s)"
+            )
+        return False, msg
     if int(asset.get("unused_assets_count", 0) or 0) and int(asset.get("image_link_count", 0) or 0) == 0:
         msg = "Asset report has unused assets but no note image links"
         if repair_info and repair_info.get("rounds_completed", 0) > 0:
@@ -531,7 +721,70 @@ def final_delivery_status(
                 f" | Unresolved repairs after {repair_info['rounds_completed']} round(s)"
             )
         return False, msg
+    if asset.get("status") not in {None, "", "pass"}:
+        return False, f"Asset report is {asset.get('status', 'unknown')}"
+    failed_asset_gates = asset.get("failed_gates", [])
+    if failed_asset_gates:
+        return False, "Asset report failed gates: " + ", ".join(map(str, failed_asset_gates))
+    unmatched_report = asset.get("unmatched_asset_report")
+    if isinstance(unmatched_report, dict) and unmatched_report.get("status") not in {None, "", "pass"}:
+        return False, f"Unmatched asset report is {unmatched_report.get('status', 'unknown')}"
+    if isinstance(unmatched_report, dict) and unmatched_report.get("failed_gates"):
+        return False, "Unmatched asset report failed gates: " + ", ".join(
+            map(str, unmatched_report.get("failed_gates", []))
+        )
     return True, "final delivery gates passed"
+
+
+def _paper_failed_gates(paper: dict[str, Any]) -> list[str]:
+    gates: list[str] = []
+    stages = paper.get("stages", {})
+    for stage_name, stage in stages.items():
+        if not isinstance(stage, dict):
+            continue
+        if stage.get("ok") is True:
+            continue
+        status = str(stage.get("status") or "")
+        for gate in stage.get("failed_gates", []) or []:
+            gate_text = f"{stage_name}/{gate}" if "/" not in str(gate) else str(gate)
+            if gate_text not in gates:
+                gates.append(gate_text)
+        if status and status != "pass":
+            gate_text = f"{stage_name}/{status}"
+            if gate_text not in gates:
+                gates.append(gate_text)
+        elif stage_name in {"validate", "cleanup_report", "final_delivery"} and stage:
+            gate_text = f"{stage_name}/failed"
+            if gate_text not in gates:
+                gates.append(gate_text)
+    if paper.get("error") and not gates:
+        gates.append("pipeline/error")
+    return gates
+
+
+def _next_action_for_paper(paper: dict[str, Any]) -> str:
+    stages = paper.get("stages", {})
+    quality = stages.get("quality", {})
+    domain = stages.get("domain", {})
+    validate = stages.get("validate", {})
+    cleanup = stages.get("cleanup_report", {})
+    final = stages.get("final_delivery", {})
+    scope = quality.get("repair_scope")
+    failed_gates = set(map(str, quality.get("failed_gates", []) or []))
+    domain_gates = set(map(str, domain.get("failed_gates", []) or []))
+    if any("paper_type_alignment" in gate for gate in domain_gates):
+        return "domain_regeneration"
+    if scope in {"item_patch", "section_patch", "regeneration"}:
+        return "full_regeneration" if scope == "regeneration" else scope
+    if {"formula_depth", "evidence_narrative"} & failed_gates:
+        return "item_patch"
+    if "evidence_coverage" in failed_gates or (validate and validate.get("ok") is not True):
+        return "section_patch"
+    if cleanup and cleanup.get("ok") is not True:
+        return "asset_repair"
+    if final and final.get("ok") is not True:
+        return "manual_review_required"
+    return "manual_review_required"
 
 
 def write_final_report(path: Path, summary: list[dict[str, Any]], production_mode: str) -> None:
@@ -554,8 +807,15 @@ def write_final_report(path: Path, summary: list[dict[str, Any]], production_mod
         and paper.get("stages", {}).get("final_delivery", {}).get("ok") is not True
     )
 
+    gate_clusters: dict[str, int] = {}
+    for paper in summary:
+        for gate in _paper_failed_gates(paper):
+            gate_clusters[gate] = gate_clusters.get(gate, 0) + 1
+
     lines = [
         "# Batch Final Delivery Report",
+        "",
+        "## Batch Health",
         "",
         f"- production_mode: `{production_mode}`",
         f"- total_papers: {total}",
@@ -564,17 +824,63 @@ def write_final_report(path: Path, summary: list[dict[str, Any]], production_mod
         f"- papers_with_repair_attempts: {repaired}",
         f"- unresolved_repairs: {unresolved}",
         "",
-        "| paper_key | final | quality | validation | repair | cleanup | note/source pack | issue |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "## Failed Gate Clusters",
+        "",
     ]
+    if gate_clusters:
+        for gate, count in sorted(gate_clusters.items(), key=lambda item: (-item[1], item[0])):
+            lines.append(f"- {gate}: {count} paper(s)")
+    else:
+        lines.append("- <none>")
+    lines.extend(
+        [
+            "",
+            "## Next Repair Queue",
+            "",
+        ]
+    )
+    queue_index = 1
+    for paper in summary:
+        if paper.get("stages", {}).get("final_delivery", {}).get("ok") is True:
+            continue
+        labels: list[str] = []
+        quality = paper.get("stages", {}).get("quality", {})
+        for item in quality.get("failed_items", []) or []:
+            label = item.get("display_label") or item.get("item_key")
+            if label and label not in labels:
+                labels.append(str(label))
+        action = _next_action_for_paper(paper)
+        lines.append(
+            f"{queue_index}. `{paper.get('paper_key', '')}` - {action}"
+            + (f" - {', '.join(labels[:5])}" if labels else "")
+        )
+        queue_index += 1
+    if queue_index == 1:
+        lines.append("- <none>")
+    lines.extend(
+        [
+            "",
+            "## Paper Table",
+            "",
+        "| paper_key | final | quality | domain | validation | repair | cleanup | note/source pack | issue |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+    )
     for paper in summary:
         stages = paper.get("stages", {})
         final_stage = stages.get("final_delivery", {})
         quality = stages.get("quality", {})
+        domain = stages.get("domain", {})
         validate = stages.get("validate", {})
         repair = stages.get("repair", {})
         cleanup = stages.get("cleanup_report", {})
-        issue = paper.get("error") or final_stage.get("message") or quality.get("message") or ""
+        issue = (
+            paper.get("error")
+            or final_stage.get("message")
+            or quality.get("message")
+            or domain.get("message")
+            or ""
+        )
 
         # Repair column: rounds completed or "-"
         repair_rounds = repair.get("rounds_completed", 0)
@@ -585,10 +891,11 @@ def write_final_report(path: Path, summary: list[dict[str, Any]], production_mod
             repair_str = "-"
 
         lines.append(
-            "| {paper_key} | {final} | {quality} | {validation} | {repair} | {cleanup} | {source_pack} | {issue} |".format(
+            "| {paper_key} | {final} | {quality} | {domain} | {validation} | {repair} | {cleanup} | {source_pack} | {issue} |".format(
                 paper_key=paper.get("paper_key", ""),
                 final="pass" if final_stage.get("ok") else "fail",
                 quality=quality.get("status") or ("pass" if quality.get("ok") else ""),
+                domain=domain.get("status") or ("pass" if domain.get("ok") else ""),
                 validation="pass" if validate.get("ok") else "fail" if validate else "",
                 repair=repair_str,
                 cleanup="pass" if cleanup.get("ok") else "fail" if cleanup else "",
@@ -612,6 +919,57 @@ def source_pack_path_for(record: dict[str, Any], work_dir: Path, key: str) -> Pa
     return (work_dir / "source-packs" / f"{key}.source-pack.json").resolve()
 
 
+def path_check(path_text: str, *, must_be_file: bool = False, must_be_dir: bool = False) -> str:
+    if not path_text:
+        return "missing"
+    path = Path(path_text).expanduser()
+    if must_be_file:
+        return "pass" if path.is_file() else "fail"
+    if must_be_dir:
+        return "pass" if path.is_dir() else "fail"
+    return "pass" if path.exists() else "fail"
+
+
+def source_pack_quality_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    full_md = str(payload.get("full_md_path") or payload.get("source_md") or "")
+    content_list = str(payload.get("content_list_path") or payload.get("content_list") or "")
+    mineru_manifest = str(payload.get("manifest_json") or "")
+    assets_dir = str(payload.get("assets_dir") or "")
+    pdf_path = str(payload.get("pdf_path") or "")
+    title = str(payload.get("title") or "")
+    risk_flags: list[str] = []
+    assets_count = 0
+    if assets_dir and Path(assets_dir).expanduser().is_dir():
+        assets_count = sum(1 for path in Path(assets_dir).expanduser().rglob("*") if path.is_file())
+    full_md_size = Path(full_md).expanduser().stat().st_size if full_md and Path(full_md).expanduser().is_file() else 0
+    checks = {
+        "pdf_exists": path_check(pdf_path, must_be_file=True) if pdf_path else "missing",
+        "full_md_exists": path_check(full_md, must_be_file=True),
+        "full_md_nonempty": "pass" if full_md_size > 0 else "fail" if full_md else "missing",
+        "content_list_exists": path_check(content_list, must_be_file=True),
+        "mineru_manifest_exists": path_check(mineru_manifest, must_be_file=True) if mineru_manifest else "missing",
+        "assets_dir_exists": path_check(assets_dir, must_be_dir=True),
+        "assets_count": assets_count,
+        "title_agreement": "unknown" if not title else "pass",
+        "reference_boundary_detected": "unknown",
+        "post_reference_content_detected": False,
+    }
+    if assets_dir and assets_count == 0:
+        risk_flags.append("low_asset_count")
+    if full_md_size == 0:
+        risk_flags.append("empty_full_md")
+    if checks["content_list_exists"] == "fail":
+        risk_flags.append("missing_content_list")
+    if checks["assets_dir_exists"] == "fail":
+        risk_flags.append("missing_assets_dir")
+    status = "fail" if any(checks[key] == "fail" for key in ("full_md_nonempty", "content_list_exists")) else "warning" if risk_flags else "pass"
+    return {
+        "status": status,
+        "checks": checks,
+        "risk_flags": risk_flags,
+    }
+
+
 def write_source_pack(record: dict[str, Any], work_dir: Path, key: str) -> Path:
     path = source_pack_path_for(record, work_dir, key)
     payload = {
@@ -629,7 +987,9 @@ def write_source_pack(record: dict[str, Any], work_dir: Path, key: str) -> Path:
         "note_assets_dir": first_value(record, "note_assets_dir", "assets_dir_for_note"),
         "copy_map_path": first_value(record, "copy_map_path"),
         "evidence_manifest_path": first_value(record, "manifest_path"),
+        "domain_template": first_value(record, "domain_template", "domain_template_path"),
     }
+    payload["source_pack_quality"] = source_pack_quality_from_payload(payload)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     record["source_pack_path"] = str(path)
@@ -670,6 +1030,7 @@ def update_sidecar(
         "--asset-report-path": first_value(record, "asset_report_path"),
         "--validation-report-path": first_value(record, "validation_report_path"),
         "--quality-report-path": first_value(record, "quality_report_path"),
+        "--domain-report-path": first_value(record, "domain_report_path"),
     }
     for flag, value in mappings.items():
         if value:
@@ -791,6 +1152,45 @@ def run_manifest(
     return True, "evidence manifest built", manifest_path
 
 
+def run_domain_precheck(
+    record: dict[str, Any],
+    work_dir: Path,
+    key: str,
+) -> tuple[bool, str, Path | None, dict[str, Any]]:
+    source_pack = first_value(record, "source_pack_path")
+    if not source_pack:
+        return False, "source_pack_path is missing", None, {}
+    source_pack_path = Path(source_pack).expanduser().resolve()
+    if not source_pack_path.is_file():
+        return False, f"source pack not found: {source_pack_path}", None, {}
+    report_path = Path(
+        first_value(record, "domain_precheck_report_path")
+        or (work_dir / "reports" / f"{key}.domain-precheck.json")
+    ).expanduser().resolve()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        str(VALIDATE_DOMAIN),
+        "--source-pack",
+        str(source_pack_path),
+        "--precheck",
+        "--json",
+    ]
+    domain_template = first_value(record, "domain_template", "domain_template_path")
+    if domain_template:
+        command.extend(["--domain-template", str(Path(domain_template).expanduser().resolve())])
+    result = run(command)
+    output = result.stdout or "{}"
+    report_path.write_text(output if output.endswith("\n") else output + "\n", encoding="utf-8")
+    record["domain_precheck_report_path"] = str(report_path)
+    try:
+        report = read_json(report_path)
+    except Exception:
+        report = {"status": "fail", "error": "invalid domain precheck output"}
+    ok = result.returncode == 0 and report.get("status") in {"pass", "warning"}
+    return ok, f"domain precheck status: {report.get('status', 'unknown')}", report_path, report
+
+
 def run_validation(
     record: dict[str, Any],
     work_dir: Path,
@@ -872,11 +1272,48 @@ def run_quality(
     return ok, f"quality status: {report.get('status', 'unknown')}", report_path, report
 
 
+def run_domain(
+    record: dict[str, Any],
+    work_dir: Path,
+    key: str,
+) -> tuple[bool, str, Path | None, dict[str, Any]]:
+    note = first_value(record, "note_path", "obsidian_note_path")
+    if not note:
+        return False, "note_path is missing", None, {}
+    note_path = Path(note).expanduser().resolve()
+    if not note_path.is_file():
+        return False, f"note not found: {note_path}", None, {}
+    report_path = Path(
+        first_value(record, "domain_report_path")
+        or (work_dir / "reports" / f"{key}.domain.json")
+    ).expanduser().resolve()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, str(VALIDATE_DOMAIN), "--note", str(note_path), "--json"]
+    source_pack = first_value(record, "source_pack_path")
+    if source_pack:
+        command.extend(["--source-pack", str(Path(source_pack).expanduser().resolve())])
+    domain_template = first_value(record, "domain_template", "domain_template_path")
+    if domain_template:
+        command.extend(["--domain-template", str(Path(domain_template).expanduser().resolve())])
+    result = run(command)
+    output = result.stdout or "{}"
+    report_path.write_text(output if output.endswith("\n") else output + "\n", encoding="utf-8")
+    record["domain_report_path"] = str(report_path)
+    try:
+        report = read_json(report_path)
+    except Exception:
+        report = {"status": "needs_major_repair", "repair_plan": []}
+    ok = report.get("status") == "pass"
+    return ok, f"domain status: {report.get('status', 'unknown')}", report_path, report
+
+
 def run_asset_report(
     record: dict[str, Any],
     work_dir: Path,
     key: str,
     delete_duplicate_unused: bool,
+    fail_on_duplicate_assets: bool,
+    fail_on_unmatched_assets: bool,
 ) -> tuple[bool, str, Path | None, dict[str, Any]]:
     note = first_value(record, "note_path", "obsidian_note_path")
     if not note:
@@ -901,12 +1338,52 @@ def run_asset_report(
         command.extend(["--assets-dir", first_value(record, "note_assets_dir", "assets_dir_for_note")])
     if delete_duplicate_unused:
         command.append("--delete-duplicate-unused")
+    if fail_on_duplicate_assets:
+        command.append("--fail-on-duplicates")
     result = run(command)
-    if result.returncode != 0:
-        return False, result.stderr or result.stdout, report_path, {}
+    report = read_json(report_path) if report_path.is_file() else {}
+    ok = result.returncode == 0
+    messages = [result.stderr or result.stdout] if not ok else ["asset report written"]
     record["asset_report_path"] = str(report_path)
-    report = read_json(report_path)
-    return True, "asset report written", report_path, report
+
+    content_list = first_value(record, "content_list", "content_list_path")
+    source_assets = first_value(record, "assets_dir", "assets_source_dir", "parser_assets_dir")
+    note_assets = first_value(record, "note_assets_dir", "assets_dir_for_note")
+    if content_list and source_assets and note_assets:
+        unmatched_path = Path(
+            first_value(record, "unmatched_asset_report_path")
+            or (work_dir / "reports" / f"{key}.unmatched-assets.json")
+        ).expanduser().resolve()
+        unmatched_command = [
+            sys.executable,
+            str(AUDIT_UNMATCHED_ASSETS),
+            "--content-list",
+            str(Path(content_list).expanduser().resolve()),
+            "--source-assets-dir",
+            str(Path(source_assets).expanduser().resolve()),
+            "--note-assets-dir",
+            str(Path(note_assets).expanduser().resolve()),
+            "--output",
+            str(unmatched_path),
+        ]
+        manifest = first_value(record, "manifest_path")
+        if manifest:
+            unmatched_command.extend(["--evidence-manifest", str(Path(manifest).expanduser().resolve())])
+        if fail_on_unmatched_assets:
+            unmatched_command.append("--fail-on-problem-assets")
+        unmatched_result = run(unmatched_command)
+        unmatched_report = read_json(unmatched_path) if unmatched_path.is_file() else {}
+        report["unmatched_asset_report_path"] = str(unmatched_path)
+        report["unmatched_asset_report"] = unmatched_report
+        record["unmatched_asset_report_path"] = str(unmatched_path)
+        if unmatched_result.returncode != 0:
+            ok = False
+            messages.append(unmatched_result.stderr or unmatched_result.stdout)
+        else:
+            messages.append("unmatched asset report written")
+    if not ok:
+        return False, "; ".join(message for message in messages if message), report_path, report
+    return True, "; ".join(messages), report_path, report
 
 
 # ============================================================================
@@ -954,6 +1431,9 @@ def main() -> int:
         quality_report_data: dict[str, Any] = {}
         quality_failed_gate = False
         quality_fail_message = ""
+        domain_report_data: dict[str, Any] = {}
+        domain_failed_gate = False
+        domain_fail_message = ""
         validate_failed = False
         validate_fail_message = ""
         repair_history: list[dict[str, Any]] = []
@@ -961,13 +1441,22 @@ def main() -> int:
         try:
             source_pack = write_source_pack(record, work_dir, key)
             paper_summary["source_pack_path"] = str(source_pack)
+            source_pack_payload = read_json(source_pack)
+            source_quality = source_pack_payload.get("source_pack_quality", {})
             update_sidecar(
                 sidecar,
                 record,
                 "preflight",
                 "running",
                 "source pack prepared",
-                ["--set", f"production_mode={json.dumps(args.production_mode)}"],
+                [
+                    "--set",
+                    f"production_mode={json.dumps(args.production_mode)}",
+                    "--set",
+                    f"source_pack_quality={json.dumps(source_quality, ensure_ascii=False)}",
+                    "--set",
+                    f"artifact_hashes.source_pack={json.dumps(file_sha256(source_pack))}",
+                ],
             )
 
             # --------------------------------------------------------------
@@ -975,10 +1464,27 @@ def main() -> int:
             # --------------------------------------------------------------
             if "preflight" in requested_stages:
                 ok, message = preflight(record, requested_stages)
+                if source_quality.get("status") == "fail":
+                    ok = False
+                    message = "source_pack_quality failed: " + ", ".join(
+                        source_quality.get("risk_flags", [])
+                    )
                 update_sidecar(
-                    sidecar, record, "preflight", "complete" if ok else "failed", message
+                    sidecar,
+                    record,
+                    "preflight",
+                    "complete" if ok else "failed",
+                    message,
+                    [
+                        "--set",
+                        f"source_pack_quality={json.dumps(source_quality, ensure_ascii=False)}",
+                    ],
                 )
-                paper_summary["stages"]["preflight"] = {"ok": ok, "message": message}
+                paper_summary["stages"]["preflight"] = {
+                    "ok": ok,
+                    "message": message,
+                    "source_pack_quality": source_quality,
+                }
                 if not ok:
                     raise RuntimeError(message)
 
@@ -1001,6 +1507,13 @@ def main() -> int:
                 ok, message, manifest_path = run_manifest(record, work_dir, key, source_pack)
                 extra = ["--manifest-path", str(manifest_path)] if manifest_path else []
                 extra.extend(counts_to_set_args(manifest_counts(manifest_path)))
+                if manifest_path:
+                    extra.extend(
+                        [
+                            "--set",
+                            f"artifact_hashes.evidence_manifest={json.dumps(file_sha256(manifest_path))}",
+                        ]
+                    )
                 update_sidecar(
                     sidecar,
                     record,
@@ -1015,6 +1528,40 @@ def main() -> int:
                     "manifest_path": str(manifest_path) if manifest_path else "",
                     "counts": manifest_counts(manifest_path),
                 }
+                if not ok:
+                    raise RuntimeError(message)
+
+            # --------------------------------------------------------------
+            # domain_precheck
+            # --------------------------------------------------------------
+            if "domain_precheck" in requested_stages:
+                ok, message, report_path, report = run_domain_precheck(record, work_dir, key)
+                extra_args = []
+                if report_path:
+                    extra_args.extend(
+                        [
+                            "--set",
+                            f"paths.domain_precheck_report_path={json.dumps(str(report_path))}",
+                            "--set",
+                            f"domain_precheck={json.dumps(report, ensure_ascii=False)}",
+                        ]
+                    )
+                paper_summary["stages"]["domain_precheck"] = {
+                    "ok": ok,
+                    "message": message,
+                    "domain_precheck_report_path": str(report_path) if report_path else "",
+                    "status": report.get("status", "") if report else "",
+                    "paper_type_candidate": report.get("paper_type_candidate", "") if report else "",
+                    "confidence": report.get("confidence", "") if report else "",
+                }
+                update_sidecar(
+                    sidecar,
+                    record,
+                    "domain_precheck",
+                    "complete" if ok else "failed",
+                    message,
+                    extra_args,
+                )
                 if not ok:
                     raise RuntimeError(message)
 
@@ -1057,6 +1604,9 @@ def main() -> int:
                     "message": message,
                     "quality_report_path": str(report_path) if report_path else "",
                     "status": report.get("status", "") if report else "",
+                    "failed_gates": report.get("failed_gates", []) if report else [],
+                    "failed_items": report.get("failed_items", []) if report else [],
+                    "repair_scope": report.get("repair_scope", "") if report else "",
                 }
 
                 if not ok and args.fail_on_quality_gate:
@@ -1093,6 +1643,57 @@ def main() -> int:
                     )
 
             # --------------------------------------------------------------
+            # domain
+            # --------------------------------------------------------------
+            if "domain" in requested_stages:
+                ok, message, report_path, report = run_domain(record, work_dir, key)
+                domain_report_data = report
+                extra_args = ["--domain-report-path", str(report_path)] if report_path else []
+                extra_args.extend(fields_to_set_args(domain_sidecar_fields(report_path)))
+                paper_summary["stages"]["domain"] = {
+                    "ok": ok,
+                    "message": message,
+                    "domain_report_path": str(report_path) if report_path else "",
+                    "status": report.get("status", "") if report else "",
+                    "detected_domain": report.get("detected_domain", "") if report else "",
+                    "detected_paper_type": report.get("detected_paper_type", "") if report else "",
+                    "paper_type_candidate": report.get("paper_type_candidate", "") if report else "",
+                    "failed_gates": report.get("failed_gates", []) if report else [],
+                    "conflict_fields": report.get("conflict_fields", []) if report else [],
+                }
+                if not ok and args.fail_on_domain_gate:
+                    if repair_rounds > 0:
+                        domain_failed_gate = True
+                        domain_fail_message = message
+                        update_sidecar(
+                            sidecar,
+                            record,
+                            "domain",
+                            "failed",
+                            message,
+                            extra_args,
+                        )
+                    else:
+                        update_sidecar(
+                            sidecar,
+                            record,
+                            "domain",
+                            "failed",
+                            message,
+                            extra_args,
+                        )
+                        raise RuntimeError(message)
+                else:
+                    update_sidecar(
+                        sidecar,
+                        record,
+                        "domain",
+                        "complete" if ok else "failed",
+                        message,
+                        extra_args,
+                    )
+
+            # --------------------------------------------------------------
             # validate
             # --------------------------------------------------------------
             if "validate" in requested_stages:
@@ -1112,6 +1713,10 @@ def main() -> int:
                     "message": message,
                     "validation_report_path": str(report_path) if report_path else "",
                     "counts": validation_counts(report_path),
+                    "failed_gates": [
+                        item.get("kind", "validation_error")
+                        for item in (read_json(report_path).get("errors", []) if report_path and report_path.is_file() else [])
+                    ],
                 }
 
                 if not ok:
@@ -1150,16 +1755,27 @@ def main() -> int:
             # --------------------------------------------------------------
             # repair (automatic when repair_rounds > 0 and a gate failed)
             # --------------------------------------------------------------
-            if repair_rounds > 0 and (quality_failed_gate or validate_failed):
-                # Use the quality report if available; otherwise build a minimal
-                # report from the validation failure context.
-                qr = quality_report_data if quality_report_data else {}
-                if not qr:
-                    qr = {
-                        "status": "needs_major_repair",
-                        "repair_plan": [],
-                        "scores": {},
-                    }
+            if repair_rounds > 0 and (quality_failed_gate or domain_failed_gate or validate_failed):
+                # Merge all failed gate reports into one repair context.
+                repair_reports: list[dict[str, Any]] = []
+                if quality_report_data:
+                    quality_context = dict(quality_report_data)
+                    quality_context["label"] = "quality"
+                    repair_reports.append(quality_context)
+                if domain_report_data:
+                    domain_context = dict(domain_report_data)
+                    domain_context["label"] = "domain"
+                    repair_reports.append(domain_context)
+                if validate_failed and not repair_reports:
+                    repair_reports.append(
+                        {
+                            "label": "validation",
+                            "status": "needs_major_repair",
+                            "repair_plan": [],
+                            "scores": {},
+                        }
+                    )
+                qr = merge_repair_reports(*repair_reports)
 
                 repair_level = determine_repair_level(qr)
 
@@ -1209,6 +1825,11 @@ def main() -> int:
                         f"Quality gate failed after {repair_rounds} repair round(s): "
                         f"{quality_fail_message}"
                     )
+                if domain_failed_gate:
+                    raise RuntimeError(
+                        f"Domain gate failed after {repair_rounds} repair round(s): "
+                        f"{domain_fail_message}"
+                    )
                 if validate_failed:
                     raise RuntimeError(
                         f"Validation failed after {repair_rounds} repair round(s): "
@@ -1220,6 +1841,8 @@ def main() -> int:
             if repair_rounds == 0:
                 if quality_failed_gate:
                     raise RuntimeError(quality_fail_message)
+                if domain_failed_gate:
+                    raise RuntimeError(domain_fail_message)
                 if validate_failed:
                     raise RuntimeError(validate_fail_message)
 
@@ -1228,7 +1851,12 @@ def main() -> int:
             # --------------------------------------------------------------
             if "cleanup_report" in requested_stages:
                 ok, message, report_path, report = run_asset_report(
-                    record, work_dir, key, args.delete_duplicate_unused
+                    record,
+                    work_dir,
+                    key,
+                    args.delete_duplicate_unused,
+                    args.fail_on_duplicate_assets,
+                    args.fail_on_unmatched_assets,
                 )
                 extra_args = ["--asset-report-path", str(report_path)] if report_path else []
                 if report:
@@ -1247,6 +1875,28 @@ def main() -> int:
                         ]
                     )
                     extra_args.extend(fields_to_set_args(asset_sidecar_fields(report)))
+                    unmatched_report = report.get("unmatched_asset_report")
+                    if isinstance(unmatched_report, dict):
+                        extra_args.extend(
+                            [
+                                "--set",
+                                f"counts.unmatched_source_asset_count={unmatched_report.get('missing_count', 0)}",
+                                "--set",
+                                f"counts.unmatched_problem_asset_count={unmatched_report.get('problem_count', 0)}",
+                            ]
+                        )
+                        extra_args.extend(
+                            fields_to_set_args(
+                                {
+                                    "paths.unmatched_asset_report_path": report.get(
+                                        "unmatched_asset_report_path", ""
+                                    ),
+                                    "asset_unmatched.failed_gates": ",".join(
+                                        unmatched_report.get("failed_gates", [])
+                                    ),
+                                }
+                            )
+                        )
                 update_sidecar(
                     sidecar,
                     record,
@@ -1259,6 +1909,7 @@ def main() -> int:
                     "ok": ok,
                     "message": message,
                     "asset_report_path": str(report_path) if report_path else "",
+                    "failed_gates": report.get("failed_gates", []) if report else [],
                     "counts": {
                         "image_link_count": report.get("image_link_count", 0),
                         "assets_total": report.get("assets_total", 0),

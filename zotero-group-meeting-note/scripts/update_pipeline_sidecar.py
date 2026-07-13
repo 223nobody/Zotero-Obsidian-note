@@ -15,13 +15,30 @@ STAGES = [
     "preflight",
     "parse_cache",
     "evidence_manifest",
+    "domain_precheck",
     "draft",
     "review",
     "quality",
+    "domain",
     "validate",
     "repair",
     "cleanup_report",
     "final_delivery",
+]
+
+PATH_KEYS = [
+    "pdf_path",
+    "source_md",
+    "content_list",
+    "assets_dir",
+    "note_path",
+    "manifest_path",
+    "copy_map_path",
+    "asset_report_path",
+    "unmatched_asset_report_path",
+    "validation_report_path",
+    "quality_report_path",
+    "domain_report_path",
 ]
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -45,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--asset-report-path", help="Asset audit JSON path.")
     parser.add_argument("--validation-report-path", help="validate_note.py JSON report path.")
     parser.add_argument("--quality-report-path", help="audit_note_quality.py JSON report path.")
+    parser.add_argument("--domain-report-path", help="validate_domain_consistency.py JSON report path.")
     parser.add_argument(
         "--stage",
         choices=STAGES,
@@ -76,37 +94,62 @@ def read_json(path: Path) -> Any:
 
 def load_sidecar(path: Path) -> dict[str, Any]:
     if not path.is_file():
-        return {
-            "schema_version": 1,
+        sidecar = {
+            "schema_version": 2,
             "created_at": now_iso(),
             "updated_at": now_iso(),
             "paper_key": "",
             "title": "",
-            "paths": {
-                "pdf_path": "",
-                "source_md": "",
-                "content_list": "",
-                "assets_dir": "",
-                "note_path": "",
-                "manifest_path": "",
-                "copy_map_path": "",
-                "asset_report_path": "",
-                "validation_report_path": "",
-                "quality_report_path": "",
-            },
+            "paths": {key: "" for key in PATH_KEYS},
             "stages": {
                 stage: {"status": "pending", "updated_at": "", "message": ""}
                 for stage in STAGES
             },
+            "reports": {},
+            "gates": {},
             "counts": {},
+            "source_pack_quality": {},
+            "artifact_hashes": {},
             "used_images": [],
             "unused_images": [],
             "review_items": [],
             "validation": {},
             "quality": {},
+            "domain": {},
             "errors": [],
         }
-    return read_json(path)
+        return normalize_sidecar(sidecar)
+    return normalize_sidecar(read_json(path))
+
+
+def normalize_sidecar(sidecar: dict[str, Any]) -> dict[str, Any]:
+    """Migrate older sidecars in memory while preserving existing fields."""
+    sidecar["schema_version"] = max(int(sidecar.get("schema_version", 1) or 1), 2)
+    sidecar.setdefault("created_at", now_iso())
+    sidecar.setdefault("updated_at", now_iso())
+    sidecar.setdefault("paper_key", "")
+    sidecar.setdefault("title", "")
+    paths = sidecar.setdefault("paths", {})
+    for key in PATH_KEYS:
+        paths.setdefault(key, "")
+    stages = sidecar.setdefault("stages", {})
+    for stage in STAGES:
+        stages.setdefault(stage, {"status": "pending", "updated_at": "", "message": ""})
+    sidecar.setdefault("reports", {})
+    sidecar.setdefault("gates", {})
+    sidecar.setdefault("counts", {})
+    sidecar.setdefault("source_pack_quality", {})
+    sidecar.setdefault("artifact_hashes", {})
+    sidecar.setdefault("used_images", [])
+    sidecar.setdefault("unused_images", [])
+    sidecar.setdefault("review_items", [])
+    sidecar.setdefault("validation", {})
+    sidecar.setdefault("quality", {})
+    sidecar.setdefault("domain", {})
+    sidecar.setdefault("asset", {})
+    sidecar.setdefault("asset_unmatched", {})
+    sidecar.setdefault("errors", [])
+    return sidecar
 
 
 def set_dotted(target: dict[str, Any], dotted_key: str, value: Any) -> None:
@@ -155,6 +198,7 @@ def main() -> int:
     update_path(sidecar, "asset_report_path", args.asset_report_path)
     update_path(sidecar, "validation_report_path", args.validation_report_path)
     update_path(sidecar, "quality_report_path", args.quality_report_path)
+    update_path(sidecar, "domain_report_path", args.domain_report_path)
 
     if args.stage:
         status = args.status or "complete"

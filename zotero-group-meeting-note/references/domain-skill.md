@@ -8,6 +8,20 @@ This domain should be read more narrowly than general LLM-agent work. A "skill" 
 
 Classify the paper before drafting; the same Figure/Table can mean different things in different skill papers.
 
+When available, run `scripts/validate_domain_consistency.py --source-pack <source_pack.json> --precheck --json` before drafting. Align the note's explicit `论文类型` with the returned `paper_type_candidate`, or explain why the source cues are misleading.
+
+| Type | Title/Abstract Cues | Note Emphasis |
+| --- | --- | --- |
+| `method` | propose, approach, algorithm, optimization, learning, distillation, internalization | mechanism, objective, training/inference flow, evidence chain, limits |
+| `system` | system, architecture, runtime, compiler, platform, framework, portable | modules, runtime path, engineering tradeoffs, deployment/compatibility evidence |
+| `benchmark` | benchmark, dataset, evaluation protocol, task suite, metric, audit set | task design, metrics, baselines, coverage, evaluation blind spots |
+| `survey` | survey, SoK, review, taxonomy, roadmap, comprehensive | taxonomy, scope, comparison axes, synthesis value, missing areas |
+| `security` | attack, vulnerability, injection, stealing, supply chain, permission, threat model | threat model, attack/defense surface, assumptions, empirical evidence, mitigation boundary |
+| `analysis` | empirical study, measurement, audit, characterization, observation | measurement setup, observations, causal limits, sample bias, actionable implications |
+| `theory` | theorem, proof, lemma, formal analysis, semantics, safety property | definitions, assumptions, proof intuition, applicability, gap between theorem and deployment |
+
+`paper_type_alignment` is a hard domain gate. If the source type and the note's explicit `论文类型` conflict, repair usually requires `domain_regeneration`, not a surface rename.
+
 - Skill synthesis / generation: creates skills from tasks, traces, prompts, demonstrations, documents, or virtual tests.
 - Skill retrieval / selection: chooses which skills to load or call from a library, graph, registry, or memory.
 - Skill composition / routing: combines skills, detects dependencies/conflicts, or plans over skill graphs.

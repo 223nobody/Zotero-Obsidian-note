@@ -20,6 +20,8 @@ Use the inventory to write the final note. Do not include this inventory in the 
 
 When `paper-search-mcp` parsed artifacts are available, first read `references/mcp-paper-search.md`. Use `content_list.json` for block/page order and parser-provided asset paths, `full.md` for readable captions and nearby paragraphs, and `assets_dir` for local image/table/formula files. Prefer running `scripts/build_evidence_manifest.py <content_list_path> --assets-dir <assets_dir> --full-md <full_md_path>` as the first-pass structured inventory. Run `scripts/extract_source_order.py <full_md_path>` only as a Markdown fallback or as a second opinion for low-confidence manifest rows.
 
+Manifest schema `2.0` items may include `source_order_index`, `display_label`, `normalized_label`, `paper_region`, `core_rank`, `required_narrative_slots`, `formula_slots`, `asset_bindings`, and `repair_hint`. Use these fields to decide final order, section placement, asset binding, and repair scope. Keep these fields private; they are not final-note prose.
+
 When only source text is available, prefer running `scripts/extract_source_order.py <source-file>` to get a first-pass inventory, then correct `region`, `asset path`, `source role`, `core level`, `rationale`, and `final entry style` by reading captions, nearby paragraphs, contribution statements, and experiment conclusions.
 
 An inventory row represents a paper evidence item, not an asset file. One evidence item may bind zero, one, or multiple asset files; one asset file may be ignored if it is a duplicate, page header/footer, bibliography crop, isolated layout crop, or cannot be tied to a real paper item.

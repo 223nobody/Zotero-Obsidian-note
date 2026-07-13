@@ -21,7 +21,7 @@ BANNED_PATTERNS = [
 ]
 IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<target>[^)]+)\)")
 WIKI_IMAGE_RE = re.compile(r"!\[\[(?P<target>[^\]|#]+)(?:#[^\]|]+)?(?:\|(?P<alt>[^\]]+))?\]\]")
-HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(?P<title>.+?)\s*$", re.MULTILINE)
+HEADING_RE = re.compile(r"^\s{0,3}(?P<hashes>#{1,6})\s+(?P<title>.+?)\s*$", re.MULTILINE)
 ASSET_ONLY_RE = re.compile(
     r"^\s*(?:[-*]\s*)?(?:!\[[^\]]*\]\()?assets[\\/][^) \t]+(?:\))?\s*$",
     re.IGNORECASE,
@@ -30,7 +30,7 @@ ABSOLUTE_LOCAL_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|/|\\\\)")
 EVIDENCE_ENTRY_RE = re.compile(
     r"^\s*(?:[-*+]\s*)?(?:\|+\s*)?(?:\*\*)?\s*"
     r"(?:Figure|Fig\.|Table|Equation|Eq\.|Algorithm|Alg\.|Objective|Loss|Score|"
-    r"Constraint|Prompt|Case Study|Checklist)\s*[A-Za-z]?\d*",
+    r"Constraint|Prompt|Proposition|Prop\.|Case Study|Checklist)\s*[A-Za-z]?\d*",
     re.IGNORECASE,
 )
 EVIDENCE_SECTION_RE = re.compile(
@@ -122,6 +122,10 @@ def iter_manifest_items(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     return list(manifest.get("main_items", [])) + list(manifest.get("post_reference_items", []))
 
 
+def item_region(item: dict[str, Any]) -> str:
+    return str(item.get("region") or item.get("paper_region") or "main")
+
+
 def note_image_targets(note_path: Path, text: str) -> set[str]:
     targets: set[str] = set()
     for match in IMAGE_RE.finditer(text):
@@ -171,6 +175,7 @@ def heading_spans(note_text: str) -> list[dict[str, Any]]:
         spans.append(
             {
                 "title": match.group("title"),
+                "level": len(match.group("hashes")),
                 "line": note_text.count("\n", 0, start) + 1,
                 "start": start,
                 "end": end,
@@ -221,6 +226,31 @@ def is_evidence_section_span(spans: list[dict[str, Any]], position: int) -> bool
     return bool(current and EVIDENCE_SECTION_RE.search(str(current.get("title", ""))))
 
 
+def region_for_position(spans: list[dict[str, Any]], position: int) -> str:
+    current_h2 = ""
+    for span in spans:
+        if int(span["start"]) > position:
+            break
+        if int(span.get("level", 0)) == 2:
+            current_h2 = str(span.get("title", ""))
+    if re.search(r"(参考文献后|补充|附录|appendix|supplement)", current_h2, re.IGNORECASE):
+        return "supplement"
+    if re.search(r"(图表公式|figure|table|equation|evidence)", current_h2, re.IGNORECASE):
+        return "main"
+    return ""
+
+
+def region_score_bonus(candidate_region: str, preferred_region: str | None) -> int:
+    if not preferred_region:
+        return 0
+    preferred = "main" if preferred_region == "main" else "supplement"
+    if candidate_region == preferred:
+        return 60
+    if candidate_region:
+        return -60
+    return 0
+
+
 def next_window_end(
     note_text: str,
     lines: list[dict[str, Any]],
@@ -235,7 +265,9 @@ def next_window_end(
     return len(note_text)
 
 
-def evidence_window(note_text: str, label: str) -> dict[str, Any] | None:
+def evidence_window(
+    note_text: str, label: str, preferred_region: str | None = None
+) -> dict[str, Any] | None:
     spans = heading_spans(note_text)
     lines = line_spans(note_text)
     pattern = label_pattern(label)
@@ -247,7 +279,11 @@ def evidence_window(note_text: str, label: str) -> dict[str, Any] | None:
             score = 120
             if is_evidence_section_span(spans, int(span["start"])):
                 score += 20
-            candidates.append({**span, "score": score, "match_kind": "heading"})
+            candidate_region = region_for_position(spans, int(span["start"]))
+            score += region_score_bonus(candidate_region, preferred_region)
+            candidates.append(
+                {**span, "score": score, "match_kind": "heading", "region_hint": candidate_region}
+            )
 
     for index, line in enumerate(lines):
         text = str(line["text"])
@@ -269,6 +305,8 @@ def evidence_window(note_text: str, label: str) -> dict[str, Any] | None:
             score += 20
         if not is_entry and not is_heading and not has_image:
             score -= 5
+        candidate_region = region_for_position(spans, int(line["start"]))
+        score += region_score_bonus(candidate_region, preferred_region)
         start = int(line["start"])
         end = next_window_end(note_text, lines, index, heading_starts) if is_entry or has_image else int(line["end"])
         candidates.append(
@@ -279,12 +317,13 @@ def evidence_window(note_text: str, label: str) -> dict[str, Any] | None:
                 "end": end,
                 "score": score,
                 "match_kind": "entry" if is_entry else "image" if has_image else "mention",
+                "region_hint": candidate_region,
             }
         )
 
     if not candidates:
         return None
-    candidates.sort(key=lambda item: (int(item["score"]), int(item["start"])), reverse=True)
+    candidates.sort(key=lambda item: (-int(item["score"]), int(item["start"])))
     return candidates[0]
 
 
@@ -696,8 +735,9 @@ def check_evidence_coverage(
             continue
         required = bool(item.get("required_in_final"))
         high_confidence = item.get("match_confidence") == "high"
+        has_matched_asset = bool(item.get("matched_asset") or item.get("asset_paths"))
         expected_assets = []
-        if high_confidence:
+        if high_confidence or (required and has_matched_asset):
             expected_assets = expected_assets_for_item(
                 item,
                 copy_map,
@@ -708,9 +748,9 @@ def check_evidence_coverage(
         if not should_check_presence:
             continue
 
-        window = evidence_window(note_text, str(label))
+        region = item_region(item)
+        window = evidence_window(note_text, str(label), region)
         if window is None:
-            region = item.get("region", "main")
             if qa_rows is not None:
                 qa_rows.append(
                     {
@@ -741,7 +781,7 @@ def check_evidence_coverage(
             )
             continue
 
-        if item.get("region") == "main":
+        if region == "main":
             ordered_windows.append(
                 {
                     "label": label,
@@ -751,8 +791,12 @@ def check_evidence_coverage(
                 }
             )
 
-        if copy_map_authoritative and copy_map is not None and not expected_assets:
-            region = item.get("region", "main")
+        if (
+            copy_map_authoritative
+            and copy_map is not None
+            and has_matched_asset
+            and not expected_assets
+        ):
             if qa_rows is not None:
                 qa_rows.append(
                     {
@@ -782,21 +826,33 @@ def check_evidence_coverage(
         local_images = [
             record for record in images if int(window["start"]) <= int(record["start"]) < int(window["end"])
         ]
-        found_asset = any(
-            asset_matches_record(expected, record)
+        missing_local_assets = [
+            expected
             for expected in expected_assets
-            for record in local_images
-        )
-        found_elsewhere = any(
-            asset_matches_record(expected, record)
-            for expected in expected_assets
-            for record in images
-        )
+            if not any(asset_matches_record(expected, record) for record in local_images)
+        ]
+        elsewhere_assets = [
+            expected
+            for expected in missing_local_assets
+            if any(asset_matches_record(expected, record) for record in images)
+        ]
+        found_asset = not missing_local_assets
+        found_elsewhere = bool(elsewhere_assets)
         expected_names = ", ".join(
             asset.get("markdown") or asset.get("basename") or asset.get("source", "")
             for asset in expected_assets
         )
-        status = "matched" if found_asset else "misplaced" if found_elsewhere else "missing_asset"
+        missing_names = ", ".join(
+            asset.get("markdown") or asset.get("basename") or asset.get("source", "")
+            for asset in missing_local_assets
+        )
+        status = (
+            "matched"
+            if found_asset
+            else "misplaced"
+            if found_elsewhere
+            else "missing_asset"
+        )
         if qa_rows is not None:
             qa_rows.append(
                 {
@@ -823,7 +879,7 @@ def check_evidence_coverage(
                     "message": (
                         f"High-confidence evidence item '{label}' ({region}) has a matched asset "
                         "linked outside its local evidence section/window. "
-                        f"Expected locally: {expected_names}"
+                        f"Missing locally: {missing_names or expected_names}. Expected all: {expected_names}"
                     ),
                 }
             )
@@ -835,8 +891,8 @@ def check_evidence_coverage(
                     "line": int(window["line"]),
                     "message": (
                         f"High-confidence evidence item '{label}' ({region}) appears in the note, "
-                        "but none of its matched assets are linked in its local evidence window. "
-                        f"Expected one of: {expected_names}"
+                        "but not all of its matched assets are linked in its local evidence window. "
+                        f"Missing: {missing_names or expected_names}. Expected all: {expected_names}"
                     ),
                 }
             )
@@ -1012,12 +1068,35 @@ def main() -> int:
         write_qa_report(Path(args.qa_report).expanduser().resolve(), note_path, None, [])
 
     result = {
+        "schema_version": 2,
         "note": str(note_path),
         "assets_dir": str(assets_dir),
         "image_count": image_count,
         "status": "pass" if not errors else "fail",
         "errors": errors,
         "warnings": warnings,
+        "strict_evidence_summary": {
+            "missing_required_items": [
+                item.get("message", "")
+                for item in errors + warnings
+                if item.get("kind") in {"missing_required_evidence", "missing_evidence_reference"}
+            ],
+            "misplaced_items": [
+                item.get("message", "")
+                for item in errors + warnings
+                if item.get("kind") == "misplaced_evidence_asset_link"
+            ],
+            "order_violations": [
+                item.get("message", "")
+                for item in errors + warnings
+                if item.get("kind") == "evidence_order_error"
+            ],
+            "asset_link_failures": [
+                item.get("message", "")
+                for item in errors + warnings
+                if item.get("kind") in {"missing_evidence_asset_link", "missing_copy_map_entry"}
+            ],
+        },
     }
 
     if args.json:

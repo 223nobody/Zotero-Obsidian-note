@@ -24,7 +24,9 @@ Use this skill to produce a seminar-ready computer-science paper note, not a sha
 
 For final seminar notes, use `references/blueprint.md` as the single source of truth for note structure and section responsibilities. Do not create or follow a parallel final-note structure. Batch mode must enforce the same blueprint through validation gates.
 
-For `batch-final-controlled` runs, each paper must have its own source pack, evidence manifest, note path, assets directory, validation report, quality report, and repair status. Batch mode may directly produce final notes, but only notes that pass all gates may be counted as complete.
+For `batch-final-controlled` runs, each paper must have its own source pack, evidence manifest, note path, assets directory, validation report, quality report, domain report, asset report, unmatched-asset report when source assets exist, sidecar, and repair status. Batch mode may directly produce final notes, but only notes that pass all gates may be counted as complete.
+
+Read focused references when the task reaches these surfaces: `references/batch-control.md` for controlled batch execution, sidecars, resume, final gate runner, and final reports; `references/repair-pass.md` for non-pass gates and two-round repair; `references/asset-binding.md` for copy maps, SHA256 dedupe, orphan formulas, and multi-panel assets; `references/error-codes.md` for gate/report codes; `references/subagent-contract.md` before using subagents.
 
 ## Rule Precedence
 
@@ -45,8 +47,9 @@ When instructions appear to compete, resolve them in this order:
 - If an existing note is provided, preserve useful manual comments, images, terminology, and structure while fixing gaps.
 - If `paper-search-mcp` is available or the user provides a title/search query/DOI/PDF path/`paper_key`, read `references/mcp-paper-search.md` and prefer the MCP parsed-cache flow before falling back to raw PDF extraction.
 - Build a source pack when possible: `paper_key`, `pdf_path`, `full_md_path`, `content_list_path`, `manifest_path`, `assets_dir`, `result_zip_path`, and parser provenance. Use this source pack as the stable input for drafting and verification.
-- For batch or multi-paper runs, track each paper in a JSON sidecar with `scripts/update_pipeline_sidecar.py`, or run deterministic parts with `scripts/batch_note_pipeline.py`. Use the stages `preflight -> parse_cache -> evidence_manifest -> draft -> review -> quality -> validate -> cleanup_report -> final_delivery`, and keep paths, copy maps, counts, validation results, quality decisions, repair status, and unresolved errors in the sidecar rather than in the note body.
+- For batch or multi-paper runs, first read `references/batch-control.md`; track each paper in a JSON sidecar with `scripts/update_pipeline_sidecar.py`, or run deterministic parts with `scripts/batch_note_pipeline.py`. Use the stages `preflight -> parse_cache -> evidence_manifest -> domain_precheck -> draft -> review -> quality -> domain -> validate -> repair -> cleanup_report -> final_delivery`, and keep paths, copy maps, counts, source-pack quality, artifact hashes, validation results, quality/domain decisions, repair status, and unresolved errors in the sidecar rather than in the note body.
 - In batch mode, never use one paper's draft body as context for another paper. Share only the batch manifest, sidecar status, and gate reports.
+- Before using subagents, read `references/subagent-contract.md`; each subagent may see only one paper's prompt pack and artifacts.
 
 ### 2. Prepare Output Paths Before Writing
 
@@ -75,8 +78,10 @@ When instructions appear to compete, resolve them in this order:
 - When the source is Markdown with local image links, consider running `scripts/collect_assets.py <paper.md> --assets-dir <note-dir>/assets` to build a candidate image pool and optionally rewrite links. If the source or existing note uses Obsidian wiki embeds such as `![[Pasted image ...]]`, pass `--vault-root <vault>` when possible and rewrite them to relative `assets/...` Markdown links. Do not treat every copied candidate as final-note content.
 - When the source includes `content_list.json`, use it as the first source of block order, page hints, block types, and parser-provided asset paths before relying on Markdown proximity heuristics.
 - When `content_list_path` is available, prefer running `scripts/build_evidence_manifest.py <content_list_path> --assets-dir <assets_dir> --full-md <full_md_path>` before drafting. Use its output as the primary evidence/asset manifest, then correct uncertain low-confidence rows by reading `full.md` and the surrounding paper text.
-- Treat manifest JSON as a private machine-readable artifact. It may include `item_key`, `asset_paths`, `asset_hashes`, `source_blocks`, `content_payload`, `panel_roles`, `page`, `block_index`, `confidence`, `region`, `source_text`, and `final_section`; do not paste it into the final note.
-- After building the manifest, prefer `scripts/prepare_output.py --sync-from-manifest <manifest.json> --copy-map <copy-map.json>` so drafting uses copied note-local asset links from the copy map instead of guessing filenames.
+- Treat equation blocks without `img_path` as first-class evidence. If MinerU exported formula-looking orphan crops, recover or audit them with `scripts/audit_unmatched_assets.py` instead of silently dropping them.
+- Treat manifest `orphan_formula_candidate` assets as visual-verification candidates: copy them into the note-local assets pipeline, but verify that the formula screenshot matches the Equation/Loss label before final delivery. If the visual match cannot be confirmed, keep the LaTeX explanation and report the asset binding as unresolved rather than pretending the pairing is certain.
+- Treat manifest JSON as a private machine-readable artifact. It may include `schema_version`, `item_key`, `display_label`, `required_narrative_slots`, `formula_slots`, `repair_hint`, `asset_bindings`, `asset_paths`, `asset_hashes`, `source_blocks`, `content_payload`, `panel_roles`, `page`, `block_index`, `confidence`, `region`, `source_text`, and `final_section`; do not paste it into the final note.
+- After building the manifest, prefer `scripts/prepare_output.py --sync-from-manifest <manifest.json> --copy-map <copy-map.json>` so drafting uses copied note-local asset links from the copy map instead of guessing filenames. Keep the default global SHA256 dedupe: when multiple MinerU paths contain identical image bytes, preserve all evidence bindings in the copy map but link them to one canonical note-local asset file.
 - When the source is Markdown or extracted text, consider running `scripts/extract_source_order.py <source-file>` to create a first-pass mixed evidence inventory before drafting. Use its `asset path` column to bind images, table crops, and formula crops to the corresponding Figure / Table / Equation entries. Use `--include-mentions` only when you need to audit prose references separately from captions/objects.
 - Treat `References` / `Bibliography` / `参考文献` as a boundary. Do not summarize the bibliography itself. If the paper contains appendix, supplementary, prompt, case-study, implementation, ethics, checklist, or extra evidence after the bibliography, or appendix/supplementary content that is clearly outside the main-paper argument, handle it separately after the strengths/limitations/discussion section.
 - When the paper direction is clear, load only the matching domain reference:
@@ -121,6 +126,7 @@ Capture at least:
 - Prioritize: innovation analysis, figure/table/formula explanation, conclusion data interpretation, and related-work comparison.
 - In `## 五、图表公式解释`, arrange Figure / Table / Equation / Loss / Objective / Score / Constraint entries together by their first appearance in the original paper. Use the item-specific templates from `references/blueprint.md`, but do not split the final note into separate figure, table, and formula blocks.
 - Place each matched image, table crop, or formula crop directly under its corresponding evidence entry. Do not put matched evidence images only in a final asset index.
+- When one Figure is split into multiple MinerU chart/image blocks, keep all semantically linked panels under the same Figure entry and explain what each panel shows. A multi-panel evidence item is incomplete if only one panel image is linked.
 - Never include `## 附录：MinerU 图片资源完整性索引`, `MinerU asset`, `MinerU extra crop`, or a filename-only asset dump in the final note. The note is a paper explanation, not a MinerU asset audit. Move key images into the right evidence entries and keep unmatched assets out of the final note unless the user explicitly requests an asset audit.
 - If the paper has substantive content after References/Bibliography, or supplementary/appendix content that should not be mixed into the main evidence timeline, add `## 八、参考文献后内容与补充材料` after the strengths/limitations/discussion section. Put those figures, tables, equations, prompts, case studies, checklists, and implementation details there, preserving their own order and matched assets.
 - If the user asks for a PPT outline, preserve the same analytical order but output slide titles, bullet points, figure/table placement, and oral cue lines.
@@ -139,10 +145,16 @@ For every important figure, table, formula, and result:
 
 - Read `references/review-pass.md` after the first full draft and before final delivery.
 - Read `references/validation.md` when validating a written note or after changing skill scripts/references.
+- Read `references/repair-pass.md` before repairing any non-pass gate; repair instructions must come from item-level gate reports or `scripts/build_repair_context.py`, not from a vague batch-level failure summary.
 - Read `references/terminology.md` when translating technical terms, and prefer its standard renderings when they fit the paper.
 - When full text is available as Markdown or text, consider running `scripts/extract_terms.py <source-file>` to collect recurring English term candidates before polishing.
 - When the note has been written to disk, run `scripts/validate_note.py <note-path>` to catch banned MinerU asset indexes, absolute/stale image links, missing `assets/...` files, and resource-dump sections before reporting completion. If an evidence manifest exists, run `scripts/validate_note.py <note-path> --evidence-manifest <manifest.json> --copy-map <copy-map.json> --strict-evidence` for batch delivery or whenever image placement must be enforced.
 - For final or batch delivery, also run `scripts/audit_note_quality.py --note <note-path> --source-pack <source-pack.json> --evidence-manifest <manifest.json> --blueprint references/blueprint.md --json` when the source pack exists. Treat `needs_minor_repair`, `needs_major_repair`, and `needs_regeneration` as unfinished states until the requested repair loop has run or the unresolved issue is reported.
+- For one-paper final delivery, prefer `scripts/final_gate_runner.py` after drafting/review. It runs validation, quality, domain, asset, unmatched-asset, and final-delivery checks into one `final-gate.json`, and can update the sidecar. Use this runner only for one paper at a time.
+- Treat quality `draft_artifacts` failures as hard unfinished states. Remove placeholder phrases, unresolved `待核对图片` entries that should have been resolved, `可复核数字包括`, and internal pipeline wording from the final note unless they are deliberately reported as unresolved placeholders.
+- Treat quality `math_format`, `formula_depth`, and `evidence_narrative` failures as unfinished states. Inline math symbols, Greek letters, subscripts, superscripts, constraints, and formula functions must use LaTeX math instead of code spans; core Figure/Table/Equation entries must be evidence narratives rather than caption restatements or rigid template fill-ins.
+- For agent-skill or otherwise domain-sensitive papers, also run `scripts/validate_domain_consistency.py --note <note-path> --source-pack <source-pack.json> --json` and keep the domain report in the sidecar. Treat non-pass domain status as unfinished for final delivery unless explicitly accepted. This gate checks whether the note's explicit `论文类型` field matches the source paper's title/abstract; a paper-type mismatch usually requires regeneration or full repositioning, not surface polishing.
+- Before first drafting in controlled batch mode, run `scripts/validate_domain_consistency.py --source-pack <source-pack.json> --precheck --json` or the `domain_precheck` stage so the paper type and reading frame are known before prose generation.
 - First review the note against the paper and `references/blueprint.md`: remove unsupported claims, mark missing evidence, fix section gaps, and trim repetition.
 - Then scan for recurring technical English phrases and add inline Chinese translations on first important mention using the format `English phrase（中文翻译）`.
 - Prioritize phrases that are central to the task, method, objective, system module, decision frontier, or repeated experimental comparison.
@@ -164,7 +176,7 @@ The finished note should cover:
 - key formula explanations
 - a unified figure/table/formula evidence timeline arranged by original-paper order
 - matched local images placed beside their corresponding evidence entries
-- matched MCP `assets_dir` images copied or linked through the note-local `assets/` folder when the note is saved to Obsidian
+- matched MCP `assets_dir` images copied or linked through the note-local `assets/` folder when the note is saved to Obsidian, with identical SHA256 images sharing one canonical physical file
 - full explanations for core evidence and compressed explanations for non-core evidence
 - comparison and connection with related work
 - strengths, limitations, and failure modes
@@ -207,8 +219,9 @@ Before reporting completion:
 - Verify the filename is readable paper-title based unless customized.
 - Verify the date folder exists and `assets/` exists for Obsidian output.
 - If using `paper-search-mcp`, verify the source pack paths exist or report which parsed artifacts are missing.
-- If an evidence manifest was built, verify the final note's evidence timeline and matched image links against it; use the copy map to match copied assets by destination/hash and verify each image appears in the local section for its evidence item.
-- Run `scripts/audit_note_assets.py <note-path> --output <asset-report.json>` after drafting or cleanup. Keep image link counts, total assets, unused assets, duplicate hashes, and deletion actions in that JSON report; never add an asset audit section to the final note.
+- If an evidence manifest was built, verify the final note's evidence timeline and matched image links against it; use the copy map to match copied assets by destination/hash and verify each evidence item links to its canonical local asset.
+- Run `scripts/audit_note_assets.py <note-path> --output <asset-report.json>` after drafting or cleanup. For controlled final/batch output, use `--delete-duplicate-unused --fail-on-duplicates` when cleanup is allowed. Keep image link counts, total assets, unused assets, duplicate hashes, failed gates, and deletion actions in that JSON report; never add an asset audit section to the final note.
+- When MinerU source assets are available, run `scripts/audit_unmatched_assets.py --content-list <content_list.json> --source-assets-dir <assets_dir> --note-assets-dir <note-assets-dir> --evidence-manifest <manifest.json> --fail-on-problem-assets` and repair any `formula_orphan_missing`, `structured_figure_or_panel_missing`, or `manifest_matched_missing_from_final` result before delivery.
 - Verify the note body follows `references/blueprint.md` instead of becoming only an abstract summary.
 - Verify `## 五、图表公式解释` mixes figure, table, and formula entries by original-paper order.
 - Verify matched evidence images appear under the right entries rather than only in a generic appendix/resource index.
@@ -216,7 +229,10 @@ Before reporting completion:
 - Verify note image links resolve to files in the note-local `assets/` folder, especially when the source images came from MCP `assets_dir`.
 - Verify `scripts/validate_note.py <note-path>` passes, or report its remaining errors explicitly.
 - Verify the final quality status is `pass` when a quality report was generated. If it is not `pass`, report the repair level and do not count the note as a completed final note.
+- Verify the quality report has no `math_format`, `formula_depth`, or `evidence_narrative` failed gate before treating a note as final.
+- Verify the final domain status is `pass` when a domain report was generated. If it is not `pass`, report the domain repair level and do not count the note as a completed final note.
 - Verify appendix/post-reference supplementary content is handled in `## 八、参考文献后内容与补充材料` when present.
 - Verify recurring technical English phrases are translated on first key mention and remain terminology-consistent.
 - Report final paths, `paper_key` when applicable, and unresolved placeholders or asset-binding gaps.
+- In controlled batch mode, run `scripts/validate_sidecar.py <sidecar.json>` before counting a sidecar as final-delivery complete. A sidecar whose `final_delivery` stage is complete while any required gate report is missing or non-pass is invalid.
 - After the note passes validation, offer to clean up intermediate artifacts per `references/output.md#post-delivery-cleanup`. Preserve: the source PDF, `<pdf>_mineru/` parsed directory, `.paper_search_cache/`, and the final Obsidian note. Delete: evidence manifest JSONs, MinerU result zip, Zotero stubs, and test files.

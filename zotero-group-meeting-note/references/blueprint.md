@@ -34,6 +34,7 @@
 - 图片命名尽量可读且可定位，格式优先为 `<figure|table|equation|formula>-<两位编号>-<论文短标识>-<主题>.ext`，例如 `figure-01-skcc-workflow-complexity.jpg`、`table-03-skcc-pass-rate-improvement.jpg`、`equation-04-skcc-loss-objective.png`。
 - 后续写图片解释、公式分析和证据支撑关系时，优先引用已经保存到 `assets/` 的本地图片，并把图片放在对应 Figure / Table / Equation / Prompt / Case Study 条目下方，不要把图片统一堆到文末。
 - 建立图表公式清单时，为每个条目记录 `asset path`。如果图片没有直接写 Figure/Table 编号，要根据前后 3 行 caption、标题、页码、`content_list.json` 块顺序或上下文把它绑定到最可能的证据条目；无法确认时只在内部清单或外部 manifest 标为 `未匹配图片`，不要写入最终笔记，也不要臆造编号。
+- 对 MinerU 导出的公式截图要格外谨慎：即使公式 block 在 `content_list.json` 中没有 `img_path`，只要源 `assets_dir` 中存在明显公式裁图，就必须尝试绑定到对应 Equation / Loss / Objective / Score / Constraint；`orphan_formula_candidate` 只能视为候选绑定，最终稿必须视觉核对截图内容与公式编号是否一致；不能可靠绑定时要进入外部审计报告，不能静默丢弃。
 
 ## 强制覆盖规则
 
@@ -86,7 +87,7 @@
 
 - 每个 Figure / Table / Equation / Loss / Objective / Score / Constraint 条目都应优先使用与它匹配的本地图片或公式截图；如果没有可靠匹配，可保留文字/LaTeX 解释并标注 `无匹配图片 / 待核对图片`。
 - 图片必须出现在对应条目的标题之后、解释之前或解释内部；不要在正文解释某个 Figure，却把图片放到文末资源索引。
-- 如果同一 Figure 被 MinerU 切成多个 panel 或多个局部截图，可以在同一个条目下连续放置多张图片，并用一句话说明每张 panel 对应哪一部分。
+- 如果同一 Figure 被 MinerU 切成多个 panel 或多个局部截图，必须在同一个条目下连续放置所有语义相关的 panel 图片，并说明每张 panel 对应哪一部分；只放一个代表性 panel 会造成证据不完整。
 - 如果图片是页眉、页脚、参考文献截图、无 caption 裁剪图、重复局部图，默认不要放入最终笔记正文；只在内部核对清单或外部 manifest 中记录。
 - 如果无法把图片和原文证据项匹配，不要把它写进最终笔记；在内部核对清单或外部 manifest 中标为 `未匹配图片：<source-asset-file>`，并说明可能位置和需要人工核对的原因。
 - 最终笔记中不得出现 `## 附录：MinerU 图片资源完整性索引`、`MinerU asset`、`MinerU extra crop` 或按文件名堆叠的资源审计段落。若生成草稿中出现，必须删除；其中真正关键的图片要移到对应 Figure / Table / Equation / Prompt / Case Study 条目下。
@@ -210,7 +211,7 @@
 
 下面三类内容是这份蓝图的重点。默认逐项覆盖，不允许只贴标题或只抄 caption。
 写作时先根据 `references/source-order.md` 建立统一的 Figure / Table / Equation 出现顺序清单，再在 `## 五、图表公式解释` 中混合填入所有条目；不要按类型分成三个板块，也不要按重要性或叙事便利重新排序。
-同时给每个条目标注核心程度：核心项写完整解释，非核心项写压缩解释。下面仍保留 Figure / Table / Equation 三套写法要求和模板；它们只决定每个条目怎么分析，不决定最终排列分组。
+同时给每个条目标注核心程度：核心项写完整解释，非核心项写压缩解释。下面仍保留 Figure / Table / Equation 三套写法要求和模板；它们只决定每个条目怎么分析，不决定最终排列分组。模板是检查清单，不是必须逐字保留的小标题骨架；当核心证据需要更深分析时，可以改写为自然段或更贴合论文的子结构，但必须覆盖模板要求的分析维度。
 
 ### Figure 条目写法（用于统一章节中）
 
@@ -336,6 +337,7 @@
 - 它本质上在计算、约束、优化或证明什么。
 - 为什么需要这个公式，而不是更简单的替代方案。
 - 它和创新点或实验提升的联系是什么。
+- 对损失函数、打分函数、检索/排序公式和 attention/diagnostic 公式，必须额外解释它与负例构造、候选排序、指标定义、消融表或性能结论之间的关系；不要只写“这是训练目标”或“这是计算公式”。
 
 #### 公式完整解释模板
 

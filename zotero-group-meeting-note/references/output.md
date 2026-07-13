@@ -211,6 +211,7 @@ python scripts/prepare_output.py `
 ```
 
 Draft from the copy map's `markdown` fields. The copy map records each manifest `item_key`, copied destination, and SHA256 hashes so validators can distinguish same-basename assets from different source folders.
+By default, `prepare_output.py` now deduplicates copied assets by global SHA256 inside the note-local `assets/` folder. If two MinerU paths contain the same image bytes, keep both evidence bindings in the copy map but point them to one canonical `assets/<file>` Markdown path. Use `--dedupe-by-hash stem` only when debugging legacy filename behavior, and avoid `--dedupe-by-hash none` for final batch output.
 
 If an image cannot be extracted, keep an explicit placeholder rather than silently dropping it.
 
@@ -223,7 +224,7 @@ python scripts/audit_note_assets.py "<note-path>" `
   --output "<note-dir>\asset-report.json"
 ```
 
-The report records image link count, resolved link count, total assets, referenced assets, unused assets, duplicate hash count, duplicate groups, and any deleted files. For cleanup, prefer a dry report first. If the user approves cleanup or the batch policy allows it:
+The report records image link count, resolved link count, total assets, referenced assets, unused assets, duplicate hash count, duplicate groups, failed gates, and any deleted files. For cleanup, prefer a dry report first. If the user approves cleanup or the batch policy allows it:
 
 ```powershell
 python scripts/audit_note_assets.py "<note-path>" `
@@ -231,6 +232,8 @@ python scripts/audit_note_assets.py "<note-path>" `
   --scan-sibling-notes `
   --delete-duplicate-unused
 ```
+
+For final controlled batch delivery, add `--fail-on-duplicates` after cleanup so repeated physical files cannot pass silently. Shared evidence links are acceptable when they point to the same canonical file; duplicate SHA256 groups in `assets/` are not.
 
 Use `--scan-sibling-notes` whenever multiple notes share the same date-level `assets/` directory. Use `--delete-unused` only when you are certain no unreferenced file in the note-local `assets/` directory is needed by another note. For batch runs, prefer per-paper asset subdirectories or sibling-note scanning before deleting anything.
 
