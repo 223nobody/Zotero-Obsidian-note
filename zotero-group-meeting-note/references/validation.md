@@ -47,6 +47,8 @@ python scripts/final_gate_runner.py `
 ```
 
 The runner creates validation, quality, domain, asset, unmatched-asset, and final-gate JSON reports for exactly one paper. It is not a drafting tool and must not be used to process multiple paper bodies in one context.
+When `--source-pack` is supplied, the runner may infer `content_list` and source assets from the source pack if explicit paths are omitted. For controlled batch output, missing source assets make the unmatched-asset gate fail; do not silently skip this gate for MinerU-backed papers.
+If a child gate command exits nonzero, the runner treats that report as unfinished even if the child process printed `status=pass`. The normalized report records `command_returncode` and `command_failed`, so final delivery cannot pass on a subprocess false positive.
 
 Every report used by final delivery should expose these top-level fields when possible:
 
@@ -57,7 +59,9 @@ Every report used by final delivery should expose these top-level fields when po
   "status": "pass | fail | warning | needs_minor_repair | needs_major_repair | needs_regeneration | skipped",
   "ok": true,
   "failed_gates": [],
-  "problem_count": 0
+  "problem_count": 0,
+  "input_paths": {},
+  "input_hashes": {}
 }
 ```
 
@@ -67,7 +71,7 @@ For sidecars, run:
 python scripts/validate_sidecar.py "<sidecar.json>" --write-migrated --json
 ```
 
-The sidecar validator checks stage schema, report paths, artifact hashes, and whether `final_delivery=complete` is backed by pass-status gate reports.
+The sidecar validator checks stage schema, report paths, artifact hashes, stale input hashes, repair-round limits, final-gate report status, final-gate paper/note identity, final-gate report path consistency, and whether `final_delivery=complete` is backed by pass-status gate reports. A report is stale when its recorded `input_hashes` no longer match the current note, source pack, evidence manifest, copy map, content list, blueprint path, note assets directory, or source assets directory.
 
 ## Per-Note Validation
 

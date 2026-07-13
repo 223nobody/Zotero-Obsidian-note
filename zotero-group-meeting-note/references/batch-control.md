@@ -68,6 +68,9 @@ python scripts/final_gate_runner.py `
 ```
 
 The runner is the preferred one-paper final gate entrypoint. It does not draft or repair prose. It only runs the required final reports, emits `<paper-key>.final-gate.json`, writes report paths back to the sidecar when `--sidecar` is supplied, and marks `final_delivery` complete only when every required report is pass.
+The runner records `input_hashes` in its reports. After any note, source-pack, manifest, copy-map, content-list, or blueprint change, rerun the runner rather than reusing old reports. For MinerU-backed papers, source assets should be passed directly or inferable from `source_pack.json`; otherwise the unmatched-asset gate is unfinished.
+The runner also treats any nonzero child command return code as a failed gate, even when the child report body claims `status=pass`.
+The runner records file and directory input fingerprints. Note-local assets and MinerU source assets are stale inputs: if files are deleted, added, or modified, rerun the final gate runner.
 
 Equivalent batch-stage validation is:
 
@@ -85,12 +88,14 @@ python scripts/batch_note_pipeline.py "<single-or-batch.json>" `
   --final-report "<batch-final-summary.md>"
 ```
 
+In this mode, the `final_delivery` stage calls `scripts/final_gate_runner.py` once per paper and relies on its `final-gate.json`; it must not complete from old report paths alone.
+
 ## Sidecar Rules
 
 - Store paths, report statuses, failed gates, failed items, repair history, source-pack quality, and artifact hashes in the sidecar.
 - Do not treat stale reports as current after the note, source pack, evidence manifest, or copy map changes.
 - `final_delivery=pass` requires validation, quality, domain, asset, and unmatched-asset gates to pass.
-- Use `scripts/validate_sidecar.py "<sidecar.json>" --write-migrated --json` to migrate older sidecars to schema v2 and verify that final-delivery status is consistent with gate reports.
+- Use `scripts/validate_sidecar.py "<sidecar.json>" --write-migrated --json` to migrate older sidecars to schema v2 and verify that final-delivery status is consistent with gate reports, same-paper/same-note final-gate report status, repair-round limits, report input hashes, and asset-directory fingerprints.
 
 ## Batch Report Rules
 

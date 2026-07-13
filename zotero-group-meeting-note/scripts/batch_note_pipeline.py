@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import gate_common
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BUILD_MANIFEST = SCRIPT_DIR / "build_evidence_manifest.py"
@@ -25,6 +27,7 @@ VALIDATE_DOMAIN = SCRIPT_DIR / "validate_domain_consistency.py"
 AUDIT_ASSETS = SCRIPT_DIR / "audit_note_assets.py"
 AUDIT_UNMATCHED_ASSETS = SCRIPT_DIR / "audit_unmatched_assets.py"
 UPDATE_SIDECAR = SCRIPT_DIR / "update_pipeline_sidecar.py"
+FINAL_GATE_RUNNER = SCRIPT_DIR / "final_gate_runner.py"
 
 STAGES = [
     "preflight",
@@ -160,7 +163,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def run(command: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, text=True, capture_output=True, encoding="utf-8")
+    return subprocess.run(command, text=True, capture_output=True, encoding="utf-8", errors="replace")
 
 
 def read_json(path: Path) -> Any:
@@ -769,6 +772,10 @@ def _next_action_for_paper(paper: dict[str, Any]) -> str:
     validate = stages.get("validate", {})
     cleanup = stages.get("cleanup_report", {})
     final = stages.get("final_delivery", {})
+    failed_gate_candidates = _paper_failed_gates(paper)
+    common_action = gate_common.next_action_for_failed_gates(failed_gate_candidates)
+    if common_action not in {"none", "manual_review_required"}:
+        return common_action
     scope = quality.get("repair_scope")
     failed_gates = set(map(str, quality.get("failed_gates", []) or []))
     domain_gates = set(map(str, domain.get("failed_gates", []) or []))
@@ -1386,6 +1393,84 @@ def run_asset_report(
     return True, "; ".join(messages), report_path, report
 
 
+def run_final_gate(
+    record: dict[str, Any],
+    work_dir: Path,
+    key: str,
+    sidecar: Path,
+    *,
+    strict_evidence: bool,
+    copy_map_authoritative: bool,
+    delete_duplicate_unused: bool,
+    fail_on_duplicate_assets: bool,
+    fail_on_unmatched_assets: bool,
+    blueprint: Path | None,
+) -> tuple[bool, str, Path | None, dict[str, Any]]:
+    note = first_value(record, "note_path", "obsidian_note_path")
+    if not note:
+        return False, "note_path is missing", None, {}
+    note_path = Path(note).expanduser().resolve()
+    if not note_path.is_file():
+        return False, f"note not found: {note_path}", None, {}
+    output_path = Path(
+        first_value(record, "final_gate_report_path")
+        or (work_dir / "reports" / f"{key}.final-gate.json")
+    ).expanduser().resolve()
+    command = [
+        sys.executable,
+        str(FINAL_GATE_RUNNER),
+        "--paper-key",
+        key,
+        "--note",
+        str(note_path),
+        "--reports-dir",
+        str(work_dir / "reports"),
+        "--output",
+        str(output_path),
+        "--sidecar",
+        str(sidecar),
+        "--json",
+    ]
+    source_pack = first_value(record, "source_pack_path")
+    if source_pack:
+        command.extend(["--source-pack", str(Path(source_pack).expanduser().resolve())])
+    manifest = first_value(record, "manifest_path")
+    if manifest:
+        command.extend(["--evidence-manifest", str(Path(manifest).expanduser().resolve())])
+    copy_map = first_value(record, "copy_map_path")
+    if copy_map:
+        command.extend(["--copy-map", str(Path(copy_map).expanduser().resolve())])
+    content_list = first_value(record, "content_list", "content_list_path")
+    if content_list:
+        command.extend(["--content-list", str(Path(content_list).expanduser().resolve())])
+    source_assets = first_value(record, "assets_dir", "assets_source_dir", "parser_assets_dir")
+    if source_assets:
+        command.extend(["--source-assets-dir", str(Path(source_assets).expanduser().resolve())])
+    note_assets = first_value(record, "note_assets_dir", "assets_dir_for_note")
+    if note_assets:
+        command.extend(["--note-assets-dir", str(Path(note_assets).expanduser().resolve())])
+    if blueprint:
+        command.extend(["--blueprint", str(blueprint)])
+    if strict_evidence:
+        command.append("--strict-evidence")
+    if copy_map_authoritative:
+        command.append("--copy-map-authoritative")
+    if delete_duplicate_unused:
+        command.append("--delete-duplicate-unused")
+    if fail_on_duplicate_assets:
+        command.append("--fail-on-duplicate-assets")
+    if fail_on_unmatched_assets:
+        command.append("--fail-on-unmatched-assets")
+    result = run(command)
+    report = read_json(output_path) if output_path.is_file() else {}
+    record["final_gate_report_path"] = str(output_path)
+    ok = result.returncode == 0 and report.get("status") == "pass"
+    if ok:
+        return True, "final gate status: pass", output_path, report
+    message = result.stderr or result.stdout or f"final gate status: {report.get('status', 'unknown')}"
+    return False, message.strip(), output_path if output_path.is_file() else None, report
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -1926,21 +2011,25 @@ def main() -> int:
             # final_delivery
             # --------------------------------------------------------------
             if "final_delivery" in requested_stages:
-                repair_info: dict[str, Any] = {
-                    "rounds_completed": len(repair_history),
-                }
-                ok, message = final_delivery_status(record, repair_info)
-                update_sidecar(
-                    sidecar,
+                ok, message, report_path, report = run_final_gate(
                     record,
-                    "final_delivery",
-                    "complete" if ok else "failed",
-                    message,
-                    ["--set", f"final_status={json.dumps('pass' if ok else 'fail')}"],
+                    work_dir,
+                    key,
+                    sidecar,
+                    strict_evidence=args.strict_evidence,
+                    copy_map_authoritative=args.copy_map_authoritative,
+                    delete_duplicate_unused=args.delete_duplicate_unused,
+                    fail_on_duplicate_assets=args.fail_on_duplicate_assets,
+                    fail_on_unmatched_assets=args.fail_on_unmatched_assets,
+                    blueprint=blueprint,
                 )
                 paper_summary["stages"]["final_delivery"] = {
                     "ok": ok,
                     "message": message,
+                    "final_gate_report_path": str(report_path) if report_path else "",
+                    "status": report.get("status", "") if report else "",
+                    "failed_gates": report.get("failed_gates", []) if report else [],
+                    "next_action": report.get("next_action", "") if report else "",
                 }
                 if not ok:
                     raise RuntimeError(message)

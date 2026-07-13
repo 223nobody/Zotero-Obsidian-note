@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import gate_common
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 VALIDATE_NOTE = SCRIPT_DIR / "validate_note.py"
@@ -76,91 +78,133 @@ def slug(value: str) -> str:
 
 
 def read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8-sig", errors="ignore"))
+    return gate_common.read_json(path)
 
 
 def run(command: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, text=True, capture_output=True, encoding="utf-8")
+    return subprocess.run(command, text=True, capture_output=True, encoding="utf-8", errors="replace")
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    gate_common.write_json(path, payload)
 
 
-def report_from_stdout(result: subprocess.CompletedProcess[str], fallback_status: str) -> dict[str, Any]:
+def apply_command_failure(
+    report: dict[str, Any],
+    result: subprocess.CompletedProcess[str],
+    fallback_status: str,
+) -> dict[str, Any]:
+    if result.returncode == 0:
+        return report
+    status = str(report.get("status", "") or "")
+    if status not in gate_common.NON_BLOCKING_STATUSES:
+        return report
+    failed_gates = report.get("failed_gates", [])
+    if not isinstance(failed_gates, list):
+        failed_gates = [str(failed_gates)] if failed_gates else []
+    if "command_failed" not in failed_gates:
+        failed_gates.append("command_failed")
+    report["failed_gates"] = failed_gates
+    report["status"] = fallback_status if fallback_status not in gate_common.NON_BLOCKING_STATUSES else "fail"
+    report["ok"] = False
+    report["command_returncode"] = result.returncode
+    if result.stderr:
+        report["stderr"] = result.stderr
+    try:
+        current_problem_count = int(report.get("problem_count", 0) or 0)
+    except (TypeError, ValueError):
+        current_problem_count = 0
+    report["problem_count"] = max(current_problem_count, len(failed_gates), 1)
+    return report
+
+
+def report_from_stdout(
+    result: subprocess.CompletedProcess[str],
+    fallback_status: str,
+    report_type: str,
+    input_paths: dict[str, str | Path | None],
+) -> dict[str, Any]:
     try:
         report = json.loads(result.stdout or "{}")
         if isinstance(report, dict):
-            report.setdefault("status", fallback_status)
-            return report
+            normalized = gate_common.normalize_report(
+                report,
+                report_type=report_type,
+                fallback_status=fallback_status,
+            )
+            normalized = apply_command_failure(normalized, result, fallback_status)
+            return gate_common.attach_input_hashes(normalized, input_paths)
     except json.JSONDecodeError:
         pass
-    return {
-        "schema_version": 1,
+    report = {
+        "schema_version": 2,
+        "report_type": report_type,
         "status": fallback_status,
+        "ok": False,
         "failed_gates": ["invalid_gate_output"],
+        "problem_count": 1,
+        "command_returncode": result.returncode,
         "stderr": result.stderr,
     }
+    return gate_common.attach_input_hashes(report, input_paths)
 
 
-def run_stdout_report(command: list[str], report_path: Path, fallback_status: str) -> tuple[bool, dict[str, Any]]:
+def run_stdout_report(
+    command: list[str],
+    report_path: Path,
+    fallback_status: str,
+    report_type: str,
+    input_paths: dict[str, str | Path | None],
+) -> tuple[bool, dict[str, Any]]:
     result = run(command)
-    report = report_from_stdout(result, fallback_status if result.returncode == 0 else fallback_status)
+    report = report_from_stdout(result, fallback_status, report_type, input_paths)
     write_json(report_path, report)
     return result.returncode == 0 and report.get("status") == "pass", report
 
 
-def run_file_report(command: list[str], report_path: Path) -> tuple[bool, dict[str, Any]]:
+def run_file_report(
+    command: list[str],
+    report_path: Path,
+    report_type: str,
+    input_paths: dict[str, str | Path | None],
+) -> tuple[bool, dict[str, Any]]:
     result = run(command)
     try:
         report = read_json(report_path)
         if isinstance(report, dict):
-            report.setdefault("status", "pass" if not report.get("failed_gates") else "fail")
+            report = gate_common.normalize_report(
+                report,
+                report_type=report_type,
+                fallback_status="fail",
+            )
         else:
-            report = {"status": "fail", "failed_gates": ["invalid_gate_output"]}
+            report = gate_common.normalize_report(
+                {"failed_gates": ["invalid_gate_output"]},
+                report_type=report_type,
+                fallback_status="fail",
+            )
     except Exception as exc:  # noqa: BLE001 - final gate summary should capture malformed reports.
-        report = {"status": "fail", "failed_gates": ["invalid_gate_output"], "error": str(exc)}
-        write_json(report_path, report)
+        report = gate_common.normalize_report(
+            {"failed_gates": ["invalid_gate_output"], "error": str(exc)},
+            report_type=report_type,
+            fallback_status="fail",
+        )
+    report = gate_common.attach_input_hashes(report, input_paths)
+    report = apply_command_failure(report, result, "fail")
+    write_json(report_path, report)
     return result.returncode == 0 and report.get("status") == "pass", report
 
 
 def report_brief(name: str, path: Path, report: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "status": report.get("status", ""),
-        "path": str(path),
-        "failed_gates": report.get("failed_gates", []),
-        "failed_items": report.get("failed_items", []),
-        "problem_count": report.get("problem_count", 0),
-    }
+    return gate_common.report_brief(path, report)
 
 
 def failed_gate_list(reports: dict[str, dict[str, Any]]) -> list[str]:
-    gates: list[str] = []
-    for name, payload in reports.items():
-        status = str(payload.get("status", "") or "")
-        if status and status not in {"pass", "skipped"}:
-            gates.append(f"{name}/{status}")
-        for gate in payload.get("failed_gates", []) or []:
-            gate_text = f"{name}/{gate}" if "/" not in str(gate) else str(gate)
-            if gate_text not in gates:
-                gates.append(gate_text)
-    return gates
+    return gate_common.failed_gate_list(reports)
 
 
 def next_action(reports: dict[str, dict[str, Any]]) -> str:
-    failed = set(failed_gate_list(reports))
-    if any("domain" in gate and "paper_type_alignment" in gate for gate in failed):
-        return "domain_regeneration"
-    if any("asset" in gate for gate in failed):
-        return "asset_repair"
-    if any("formula_depth" in gate or "evidence_narrative" in gate for gate in failed):
-        return "item_patch"
-    if any("validation" in gate or "evidence_coverage" in gate for gate in failed):
-        return "section_patch"
-    if failed:
-        return "manual_review_required"
-    return "none"
+    return gate_common.next_action_for_failed_gates(failed_gate_list(reports))
 
 
 def update_sidecar(
@@ -190,7 +234,9 @@ def update_sidecar(
             command.extend([option, value])
     for key, value in (sets or {}).items():
         command.extend(["--set", f"{key}={json.dumps(value, ensure_ascii=False)}"])
-    run(command)
+    result = run(command)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr or result.stdout or "sidecar update failed")
 
 
 def main() -> int:
@@ -206,6 +252,18 @@ def main() -> int:
         if args.note_assets_dir
         else (note.parent / "assets").resolve()
     )
+    source_pack_paths = gate_common.infer_source_pack_paths(args.source_pack)
+    content_list_text = (
+        gate_common.resolve_pack_path(args.content_list)
+        if args.content_list
+        else source_pack_paths.get("content_list", "")
+    )
+    source_assets_dir_text = (
+        gate_common.resolve_pack_path(args.source_assets_dir)
+        if args.source_assets_dir
+        else source_pack_paths.get("source_assets_dir", "")
+    )
+    require_unmatched_assets = args.require_unmatched_assets or bool(args.source_pack)
 
     report_paths = {
         "validation": reports_dir / f"{key}.validation.json",
@@ -226,7 +284,18 @@ def main() -> int:
         validation_command.append("--strict-evidence")
     if args.copy_map_authoritative:
         validation_command.append("--copy-map-authoritative")
-    _, validation_report = run_stdout_report(validation_command, report_paths["validation"], "fail")
+    _, validation_report = run_stdout_report(
+        validation_command,
+        report_paths["validation"],
+        "fail",
+        "validation",
+        {
+            "note": note,
+            "evidence_manifest": args.evidence_manifest,
+            "copy_map": args.copy_map,
+            "blueprint": args.blueprint,
+        },
+    )
 
     quality_command = [sys.executable, str(AUDIT_QUALITY), "--note", str(note), "--json"]
     if args.source_pack:
@@ -235,12 +304,32 @@ def main() -> int:
         quality_command.extend(["--evidence-manifest", str(Path(args.evidence_manifest).expanduser().resolve())])
     if args.blueprint:
         quality_command.extend(["--blueprint", str(Path(args.blueprint).expanduser().resolve())])
-    _, quality_report = run_stdout_report(quality_command, report_paths["quality"], "needs_major_repair")
+    _, quality_report = run_stdout_report(
+        quality_command,
+        report_paths["quality"],
+        "needs_major_repair",
+        "quality",
+        {
+            "note": note,
+            "source_pack": args.source_pack,
+            "evidence_manifest": args.evidence_manifest,
+            "blueprint": args.blueprint,
+        },
+    )
 
     domain_command = [sys.executable, str(VALIDATE_DOMAIN), "--note", str(note), "--json"]
     if args.source_pack:
         domain_command.extend(["--source-pack", str(Path(args.source_pack).expanduser().resolve())])
-    _, domain_report = run_stdout_report(domain_command, report_paths["domain"], "needs_major_repair")
+    _, domain_report = run_stdout_report(
+        domain_command,
+        report_paths["domain"],
+        "needs_major_repair",
+        "domain",
+        {
+            "note": note,
+            "source_pack": args.source_pack,
+        },
+    )
 
     asset_command = [
         sys.executable,
@@ -259,34 +348,62 @@ def main() -> int:
         asset_command.append("--fail-on-duplicates")
     if args.fail_on_unused_assets:
         asset_command.append("--fail-on-unused")
-    _, asset_report = run_file_report(asset_command, report_paths["asset"])
+    _, asset_report = run_file_report(
+        asset_command,
+        report_paths["asset"],
+        "asset",
+        {
+            "note": note,
+            "note_assets_dir": note_assets_dir,
+        },
+    )
 
     unmatched_report: dict[str, Any]
-    if args.source_assets_dir:
+    if source_assets_dir_text:
         unmatched_command = [
             sys.executable,
             str(AUDIT_UNMATCHED_ASSETS),
             "--source-assets-dir",
-            str(Path(args.source_assets_dir).expanduser().resolve()),
+            str(Path(source_assets_dir_text).expanduser().resolve()),
             "--note-assets-dir",
             str(note_assets_dir),
             "--output",
             str(report_paths["unmatched_asset"]),
         ]
-        if args.content_list:
-            unmatched_command.extend(["--content-list", str(Path(args.content_list).expanduser().resolve())])
+        if content_list_text:
+            unmatched_command.extend(["--content-list", str(Path(content_list_text).expanduser().resolve())])
         if args.evidence_manifest:
             unmatched_command.extend(["--evidence-manifest", str(Path(args.evidence_manifest).expanduser().resolve())])
         if args.fail_on_unmatched_assets:
             unmatched_command.append("--fail-on-problem-assets")
-        _, unmatched_report = run_file_report(unmatched_command, report_paths["unmatched_asset"])
+        _, unmatched_report = run_file_report(
+            unmatched_command,
+            report_paths["unmatched_asset"],
+            "unmatched_asset",
+            {
+                "content_list": content_list_text,
+                "evidence_manifest": args.evidence_manifest,
+                "source_assets_dir": source_assets_dir_text,
+                "note_assets_dir": note_assets_dir,
+            },
+        )
     else:
-        unmatched_report = {
-            "schema_version": 1,
-            "report_type": "unmatched_asset",
-            "status": "fail" if args.require_unmatched_assets else "skipped",
-            "failed_gates": ["missing_source_assets_dir"] if args.require_unmatched_assets else [],
-        }
+        unmatched_report = gate_common.normalize_report(
+            {
+                "failed_gates": ["missing_source_assets_dir"] if require_unmatched_assets else [],
+                "message": "source assets directory missing",
+            },
+            report_type="unmatched_asset",
+            fallback_status="fail" if require_unmatched_assets else "skipped",
+        )
+        gate_common.attach_input_hashes(
+            unmatched_report,
+            {
+                "content_list": content_list_text,
+                "evidence_manifest": args.evidence_manifest,
+                "note_assets_dir": note_assets_dir,
+            },
+        )
         write_json(report_paths["unmatched_asset"], unmatched_report)
 
     asset_report["unmatched_asset_report"] = unmatched_report
@@ -305,7 +422,7 @@ def main() -> int:
     failed_gates = failed_gate_list(reports)
     status = "pass" if not failed_gates else "fail"
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "report_type": "final_gate",
         "paper_key": key,
         "note": str(note),
@@ -316,6 +433,18 @@ def main() -> int:
         "failed_gates": failed_gates,
         "next_action": next_action(reports),
     }
+    gate_common.attach_input_hashes(
+        summary,
+        {
+            "note": note,
+            "source_pack": args.source_pack,
+            "evidence_manifest": args.evidence_manifest,
+            "copy_map": args.copy_map,
+            "content_list": content_list_text,
+            "source_assets_dir": source_assets_dir_text,
+            "note_assets_dir": note_assets_dir,
+        },
+    )
     output_path = Path(args.output).expanduser().resolve() if args.output else reports_dir / f"{key}.final-gate.json"
     write_json(output_path, summary)
 

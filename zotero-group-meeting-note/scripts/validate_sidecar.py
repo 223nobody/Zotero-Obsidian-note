@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import gate_common
 
 
 STAGES = [
@@ -51,7 +52,7 @@ REPORT_PATH_KEYS = {
 }
 
 VALID_STAGE_STATUS = {"pending", "running", "complete", "failed", "skipped"}
-PASS_STATUSES = {"pass", "warning"}
+PASS_STATUSES = {"pass"}
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -76,15 +77,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8-sig", errors="ignore"))
+    return gate_common.read_json(path)
 
 
 def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return gate_common.file_sha256(path)
 
 
 def normalize_sidecar(sidecar: dict[str, Any]) -> dict[str, Any]:
@@ -114,17 +111,20 @@ def normalize_sidecar(sidecar: dict[str, Any]) -> dict[str, Any]:
 
 
 def report_status(path_text: str) -> tuple[str, dict[str, Any]]:
+    return gate_common.report_status(path_text)
+
+
+def normalized_path(path_text: str) -> str:
     if not path_text:
-        return "", {}
-    path = Path(path_text).expanduser().resolve()
-    if not path.is_file():
-        return "missing_report", {}
+        return ""
+    return str(Path(path_text).expanduser().resolve())
+
+
+def safe_int(value: Any, default: int = 0) -> int:
     try:
-        report = read_json(path)
-    except Exception as exc:  # noqa: BLE001 - validator should report malformed JSON.
-        return f"invalid_json:{exc}", {}
-    status = str(report.get("status", "pass" if not report.get("failed_gates") else "fail") or "")
-    return status, report if isinstance(report, dict) else {}
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
 
 
 def validate(sidecar_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -167,6 +167,7 @@ def validate(sidecar_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                 errors.append({"kind": "missing_path", "path_key": key, "path": str(path)})
 
     report_statuses: dict[str, str] = {}
+    report_staleness: list[dict[str, Any]] = []
     failed_gates: list[str] = []
     for path_key, gate_name in REPORT_PATH_KEYS.items():
         status, report = report_status(str(paths.get(path_key, "")))
@@ -177,10 +178,29 @@ def validate(sidecar_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
             failed_gates.append(f"{gate_name}/{gate}")
         if status not in PASS_STATUSES:
             failed_gates.append(f"{gate_name}/{status}")
+        for stale in gate_common.stale_input_hashes(report):
+            stale_record = dict(stale)
+            stale_record["gate"] = gate_name
+            report_staleness.append(stale_record)
+            errors.append(
+                {
+                    "kind": "stale_gate_report",
+                    "gate": gate_name,
+                    "input": stale.get("input", ""),
+                    "path": stale.get("path", ""),
+                }
+            )
 
     final_stage = stages.get("final_delivery", {})
     final_status = str(final_stage.get("status", "")) if isinstance(final_stage, dict) else ""
     if final_status == "complete":
+        if sidecar.get("final_status") != "pass":
+            errors.append(
+                {
+                    "kind": "final_delivery_status_mismatch",
+                    "final_status": sidecar.get("final_status", ""),
+                }
+            )
         required_reports = ["validation", "quality", "domain", "asset"]
         for gate_name in required_reports:
             status = report_statuses.get(gate_name, "")
@@ -193,7 +213,16 @@ def validate(sidecar_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                     }
                 )
         unmatched_status = report_statuses.get("unmatched_asset", "")
-        if unmatched_status and unmatched_status != "pass":
+        source_assets_available = bool(str(paths.get("assets_dir", "")).strip())
+        if source_assets_available and unmatched_status != "pass":
+            errors.append(
+                {
+                    "kind": "final_delivery_without_pass_report",
+                    "gate": "unmatched_asset",
+                    "status": unmatched_status or "missing",
+                }
+            )
+        elif unmatched_status and unmatched_status not in {"pass", "skipped"}:
             errors.append(
                 {
                     "kind": "final_delivery_without_pass_report",
@@ -201,9 +230,96 @@ def validate(sidecar_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
                     "status": unmatched_status,
                 }
             )
+        final_gate_path = str(sidecar.get("final_gate_report_path") or "")
+        if not final_gate_path:
+            errors.append({"kind": "missing_final_gate_report_path"})
+        else:
+            final_gate_status, final_gate_report = report_status(final_gate_path)
+            if final_gate_status != "pass":
+                errors.append(
+                    {
+                        "kind": "final_gate_report_not_pass",
+                        "status": final_gate_status or "missing",
+                        "path": str(Path(final_gate_path).expanduser().resolve()),
+                    }
+                )
+            if isinstance(final_gate_report, dict):
+                for stale in gate_common.stale_input_hashes(final_gate_report):
+                    stale_record = dict(stale)
+                    stale_record["gate"] = "final_gate"
+                    report_staleness.append(stale_record)
+                    errors.append(
+                        {
+                            "kind": "stale_gate_report",
+                            "gate": "final_gate",
+                            "input": stale.get("input", ""),
+                            "path": stale.get("path", ""),
+                        }
+                    )
+                if final_gate_report.get("status") != sidecar.get("final_status"):
+                    errors.append(
+                        {
+                            "kind": "final_status_not_equal_final_gate_report",
+                            "sidecar_final_status": sidecar.get("final_status", ""),
+                            "final_gate_status": final_gate_report.get("status", ""),
+                        }
+                    )
+                sidecar_note = normalized_path(str(paths.get("note_path") or ""))
+                final_gate_note = normalized_path(
+                    str(
+                        final_gate_report.get("note")
+                        or final_gate_report.get("input_paths", {}).get("note")
+                        or ""
+                    )
+                )
+                if sidecar_note and final_gate_note and sidecar_note != final_gate_note:
+                    errors.append(
+                        {
+                            "kind": "final_gate_note_mismatch",
+                            "sidecar_note": sidecar_note,
+                            "final_gate_note": final_gate_note,
+                        }
+                    )
+                sidecar_paper_key = str(sidecar.get("paper_key") or "")
+                final_gate_paper_key = str(final_gate_report.get("paper_key") or "")
+                if sidecar_paper_key and final_gate_paper_key and sidecar_paper_key != final_gate_paper_key:
+                    errors.append(
+                        {
+                            "kind": "final_gate_paper_key_mismatch",
+                            "sidecar_paper_key": sidecar_paper_key,
+                            "final_gate_paper_key": final_gate_paper_key,
+                        }
+                    )
+                report_summaries = final_gate_report.get("reports", {})
+                if isinstance(report_summaries, dict):
+                    for path_key, gate_name in REPORT_PATH_KEYS.items():
+                        expected = normalized_path(str(paths.get(path_key) or ""))
+                        actual = ""
+                        gate_summary = report_summaries.get(gate_name)
+                        if isinstance(gate_summary, dict):
+                            actual = normalized_path(str(gate_summary.get("path") or ""))
+                        if expected and actual and expected != actual:
+                            errors.append(
+                                {
+                                    "kind": "final_gate_report_path_mismatch",
+                                    "gate": gate_name,
+                                    "sidecar_report_path": expected,
+                                    "final_gate_report_path": actual,
+                                }
+                            )
+    repair = sidecar.get("repair", {}) if isinstance(sidecar.get("repair"), dict) else {}
+    rounds_completed = safe_int(repair.get("rounds_completed", 0), 0)
+    if rounds_completed > 2:
+        errors.append(
+            {
+                "kind": "repair_rounds_exceeded",
+                "rounds_completed": rounds_completed,
+                "maximum": 2,
+            }
+        )
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "report_type": "sidecar_validation",
         "sidecar": str(sidecar_path),
         "status": "fail" if errors else "pass",
@@ -211,13 +327,16 @@ def validate(sidecar_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         "errors": errors,
         "warnings": warnings,
         "failed_gates": sorted(set(failed_gates)),
+        "problem_count": len(errors),
         "summary": {
             "paper_key": sidecar.get("paper_key", ""),
             "title": sidecar.get("title", ""),
             "stage_count": len(stages),
             "path_statuses": path_statuses,
             "report_statuses": report_statuses,
+            "report_staleness": report_staleness,
             "artifact_hashes": artifact_hashes,
+            "repair_rounds_completed": rounds_completed,
         },
     }
     sidecar.setdefault("artifact_hashes", {}).update(artifact_hashes)

@@ -258,14 +258,34 @@ To run the deterministic stages for a batch file, prepare a JSON list or `{ "pap
 ```powershell
 python scripts/batch_note_pipeline.py "<batch.json>" `
   --work-dir "<batch-work-dir>" `
-  --stages preflight,parse_cache,evidence_manifest,draft,review,validate,cleanup_report `
+  --stages preflight,parse_cache,evidence_manifest,domain_precheck `
   --strict-evidence `
   --continue-on-error
 ```
 
-This helper does not draft prose or replace the LLM/manual review pass. It creates sidecars, checks parse/cache artifacts, builds evidence manifests, records draft/review checkpoints, writes validation reports, and writes asset audit reports so Codex can resume paper-by-paper. Its cleanup report stage scans sibling Markdown files in the same folder before classifying assets as unused. Use `--strict-evidence` for batch delivery so missing or misplaced manifest assets fail the stage.
+This helper does not draft prose or replace the LLM/manual review pass. It creates sidecars, checks parse/cache artifacts, builds evidence manifests, records pre-draft domain checks, and prepares deterministic state so Codex can resume paper-by-paper. Keep final-note writing, review, repair, and final validation as one-paper work.
 
-Update the sidecar after each stage: `preflight`, `parse_cache`, `evidence_manifest`, `draft`, `review`, `validate`, and `cleanup_report`. Store report paths and counts with `--set`, for example:
+After one paper's final note exists, prefer the one-paper final gate runner:
+
+```powershell
+python scripts/final_gate_runner.py `
+  --paper-key "<paper-key>" `
+  --note "<note-path>" `
+  --source-pack "<source-pack.json>" `
+  --evidence-manifest "<evidence_manifest.json>" `
+  --copy-map "<copy_map.json>" `
+  --reports-dir "<batch-work-dir>\reports" `
+  --sidecar "<sidecar.json>" `
+  --strict-evidence `
+  --copy-map-authoritative `
+  --json
+```
+
+The final gate runner writes validation, quality, domain, asset, unmatched-asset, and final-gate reports into the sidecar. It records file and asset-directory input hashes and treats stale reports or nonzero child command return codes as unfinished. Run `scripts/validate_sidecar.py "<sidecar.json>" --write-migrated --json` before counting a paper as delivered.
+
+If using `scripts/batch_note_pipeline.py ... --stages ... final_delivery`, that stage calls the same one-paper final gate runner for each paper. It is a serialized final-gate wrapper, not a separate completion rule.
+
+Update the sidecar after each stage: `preflight`, `parse_cache`, `evidence_manifest`, `domain_precheck`, `draft`, `review`, `quality`, `domain`, `validate`, `repair`, `cleanup_report`, and `final_delivery`. Store report paths and counts with `--set`, for example:
 
 ```powershell
 python scripts/update_pipeline_sidecar.py `
@@ -308,6 +328,7 @@ After writing, verify:
 - Matched images appear beside the evidence entries they support; unmatched images are not confused with paper evidence.
 - No MinerU asset-audit appendix or resource-completeness index remains in the final note.
 - `scripts/validate_note.py "<note-path>"` passes, or remaining structural errors are reported explicitly.
+- In controlled batch mode, `scripts/final_gate_runner.py` has produced a pass-status same-paper/same-note `final-gate.json`, and `scripts/validate_sidecar.py "<sidecar.json>" --json` passes before the paper is counted as complete.
 
 Report the final paths and unresolved placeholders to the user.
 

@@ -11,6 +11,9 @@ import tempfile
 import zlib
 from pathlib import Path
 
+import final_gate_runner
+import gate_common
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
@@ -30,7 +33,7 @@ CONFLICT_PATTERNS = (r"^<<<<<<< ",)
 
 
 def run(command: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, text=True, capture_output=True, encoding="utf-8")
+    return subprocess.run(command, text=True, capture_output=True, encoding="utf-8", errors="replace")
 
 
 def assert_true(condition: bool, message: str) -> None:
@@ -1705,13 +1708,297 @@ def main() -> int:
         )
         assert_true(final_gate_report.is_file(), final_gate_result.stdout + final_gate_result.stderr)
         final_gate = json.loads(final_gate_report.read_text(encoding="utf-8"))
+        assert_true(final_gate["schema_version"] == 2, "final gate report should use schema v2")
+        assert_true(
+            "note" in final_gate.get("input_hashes", {}),
+            "final gate report should record note input hash",
+        )
         assert_true(
             set(final_gate.get("reports", {})) >= {"validation", "quality", "domain", "asset", "unmatched_asset"},
             "final gate runner should emit all gate report summaries",
         )
         assert_true(
+            "input_hashes" in final_gate["reports"]["validation"],
+            "final gate report summaries should expose per-report input hashes",
+        )
+        assert_true(
             final_gate.get("status") in {"pass", "fail"},
             "final gate runner should expose pass/fail status",
+        )
+        false_pass_stdout = final_gate_runner.report_from_stdout(
+            subprocess.CompletedProcess(
+                args=["fake-validation"],
+                returncode=7,
+                stdout=json.dumps({"status": "pass", "failed_gates": []}),
+                stderr="forced failure",
+            ),
+            "fail",
+            "validation",
+            {"note": note},
+        )
+        assert_true(
+            false_pass_stdout["status"] == "fail",
+            "stdout report with failing command return code must not stay pass",
+        )
+        assert_true(
+            "command_failed" in false_pass_stdout.get("failed_gates", []),
+            "stdout report should record command_failed",
+        )
+
+        false_pass_file = root / "false-pass-file.json"
+        false_pass_writer = root / "false-pass-writer.py"
+        false_pass_writer.write_text(
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            "Path(sys.argv[1]).write_text("
+            "json.dumps({'status': 'pass', 'failed_gates': []}), encoding='utf-8')\n"
+            "sys.exit(7)\n",
+            encoding="utf-8",
+        )
+        false_file_ok, false_file_report = final_gate_runner.run_file_report(
+            [sys.executable, str(false_pass_writer), str(false_pass_file)],
+            false_pass_file,
+            "asset",
+            {"note": note},
+        )
+        assert_true(
+            not false_file_ok and false_file_report["status"] == "fail",
+            "file report with failing command return code must not stay pass",
+        )
+        assert_true(
+            "command_failed" in false_file_report.get("failed_gates", []),
+            "file report should record command_failed",
+        )
+        sidecar_update_failed = False
+        try:
+            final_gate_runner.update_sidecar(
+                str(root),
+                stage="final_delivery",
+                status="pass",
+                message="should fail because path is a directory",
+            )
+        except RuntimeError:
+            sidecar_update_failed = True
+        assert_true(sidecar_update_failed, "final gate runner should not ignore sidecar update failures")
+
+        stale_note = root / "stale-note.md"
+        stale_note.write_text("# stale\n\nfirst version\n", encoding="utf-8")
+        stale_report = root / "stale-pass-report.json"
+        stale_report.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "report_type": "validation",
+                    "status": "pass",
+                    "ok": True,
+                    "failed_gates": [],
+                    "input_paths": {"note": str(stale_note)},
+                    "input_hashes": {"note": "0" * 64},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        stale_final_report = root / "stale-final-gate.json"
+        stale_final_report.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "report_type": "final_gate",
+                    "status": "pass",
+                    "ok": True,
+                    "failed_gates": [],
+                    "input_paths": {"note": str(stale_note)},
+                    "input_hashes": {"note": "0" * 64},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        stale_sidecar = root / "stale-sidecar.json"
+        stale_sidecar.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "paper_key": "stale-smoke",
+                    "paths": {
+                        "note_path": str(stale_note),
+                        "validation_report_path": str(stale_report),
+                        "quality_report_path": str(stale_report),
+                        "domain_report_path": str(stale_report),
+                        "asset_report_path": str(stale_report),
+                    },
+                    "stages": {"final_delivery": {"status": "complete"}},
+                    "final_status": "pass",
+                    "final_gate_report_path": str(stale_final_report),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        stale_validate_result = run(
+            [sys.executable, str(VALIDATE_SIDECAR), str(stale_sidecar), "--json"]
+        )
+        assert_true(
+            stale_validate_result.returncode != 0,
+            "sidecar validator should fail stale gate reports",
+        )
+        stale_validate = json.loads(stale_validate_result.stdout)
+        assert_true(
+            any(error.get("kind") == "stale_gate_report" for error in stale_validate.get("errors", [])),
+            "sidecar validator should report stale_gate_report",
+        )
+
+        contradictory_report = root / "contradictory-pass-report.json"
+        contradictory_report.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "report_type": "validation",
+                    "status": "pass",
+                    "ok": False,
+                    "failed_gates": ["synthetic_failure"],
+                    "input_paths": {"note": str(note)},
+                    "input_hashes": {"note": gate_common.file_sha256(note)},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        contradictory_final_gate = root / "contradictory-final-gate.json"
+        contradictory_final_gate.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "report_type": "final_gate",
+                    "paper_key": "contradictory-smoke",
+                    "note": str(note),
+                    "status": "pass",
+                    "ok": True,
+                    "failed_gates": [],
+                    "input_paths": {"note": str(note)},
+                    "input_hashes": {"note": gate_common.file_sha256(note)},
+                    "reports": {
+                        gate: {"status": "pass", "path": str(contradictory_report), "failed_gates": []}
+                        for gate in ("validation", "quality", "domain", "asset")
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        contradictory_sidecar = root / "contradictory-sidecar.json"
+        contradictory_sidecar.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "paper_key": "contradictory-smoke",
+                    "paths": {
+                        "note_path": str(note),
+                        "validation_report_path": str(contradictory_report),
+                        "quality_report_path": str(contradictory_report),
+                        "domain_report_path": str(contradictory_report),
+                        "asset_report_path": str(contradictory_report),
+                    },
+                    "stages": {"final_delivery": {"status": "complete"}},
+                    "final_status": "pass",
+                    "final_gate_report_path": str(contradictory_final_gate),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        contradictory_validate_result = run(
+            [sys.executable, str(VALIDATE_SIDECAR), str(contradictory_sidecar), "--json"]
+        )
+        assert_true(
+            contradictory_validate_result.returncode != 0,
+            "sidecar validator should reject pass reports with failed_gates",
+        )
+
+        dir_hash_report = gate_common.attach_input_hashes({}, {"assets": assets})
+        old_dir_hash = dir_hash_report["input_hashes"]["assets"]
+        (assets / "directory-hash-probe.png").write_bytes(b"directory hash changed")
+        dir_staleness = gate_common.stale_input_hashes(dir_hash_report)
+        assert_true(old_dir_hash, "directory input hash should be recorded")
+        assert_true(
+            any(item.get("input") == "assets" for item in dir_staleness),
+            "directory input hash should become stale when files change",
+        )
+
+        other_note = root / "other-note.md"
+        other_note.write_text("# Other\n", encoding="utf-8")
+        cross_note_report = root / "cross-note-pass-report.json"
+        cross_note_report.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "report_type": "validation",
+                    "status": "pass",
+                    "ok": True,
+                    "failed_gates": [],
+                    "input_paths": {"note": str(note)},
+                    "input_hashes": {"note": gate_common.file_sha256(note)},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        cross_note_final_gate = root / "cross-note-final-gate.json"
+        cross_note_final_gate.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "report_type": "final_gate",
+                    "paper_key": "other-smoke",
+                    "note": str(other_note),
+                    "status": "pass",
+                    "ok": True,
+                    "failed_gates": [],
+                    "input_paths": {"note": str(other_note)},
+                    "input_hashes": {"note": gate_common.file_sha256(other_note)},
+                    "reports": {
+                        gate: {"status": "pass", "path": str(cross_note_report), "failed_gates": []}
+                        for gate in ("validation", "quality", "domain", "asset")
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        cross_note_sidecar = root / "cross-note-sidecar.json"
+        cross_note_sidecar.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "paper_key": "original-smoke",
+                    "paths": {
+                        "note_path": str(note),
+                        "validation_report_path": str(cross_note_report),
+                        "quality_report_path": str(cross_note_report),
+                        "domain_report_path": str(cross_note_report),
+                        "asset_report_path": str(cross_note_report),
+                    },
+                    "stages": {"final_delivery": {"status": "complete"}},
+                    "final_status": "pass",
+                    "final_gate_report_path": str(cross_note_final_gate),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        cross_note_validate_result = run(
+            [sys.executable, str(VALIDATE_SIDECAR), str(cross_note_sidecar), "--json"]
+        )
+        assert_true(
+            cross_note_validate_result.returncode != 0,
+            "sidecar validator should reject final-gate reports for another note/paper",
+        )
+        cross_note_validate = json.loads(cross_note_validate_result.stdout)
+        cross_note_error_kinds = {error.get("kind") for error in cross_note_validate.get("errors", [])}
+        assert_true(
+            {"final_gate_note_mismatch", "final_gate_paper_key_mismatch"} & cross_note_error_kinds,
+            "sidecar validator should report final-gate identity mismatch",
         )
 
         empty_batch = root / "empty-batch.json"

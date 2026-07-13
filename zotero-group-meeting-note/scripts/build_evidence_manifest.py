@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import gate_common
+
 
 LABEL_RE = re.compile(
     r"\b(?P<kind>Figure|Fig\.|Table|Equation|Eq\.|Algorithm|Alg\.|Proposition|Theorem|Lemma)\s*"
@@ -1529,13 +1531,17 @@ def source_pack_value(source_pack: dict[str, Any], *keys: str) -> str:
     return ""
 
 
+def source_pack_path_value(source_pack: dict[str, Any], source_pack_path: Path | None, *keys: str) -> str:
+    return gate_common.resolve_pack_path(source_pack_value(source_pack, *keys), source_pack_path)
+
+
 def apply_source_pack_metadata(manifest: dict[str, Any], source_pack: dict[str, Any], path: Path) -> None:
     manifest["source_pack_path"] = str(path)
     manifest["paper_key"] = source_pack_value(source_pack, "paper_key", "key", "id")
     manifest["title"] = source_pack_value(source_pack, "title")
-    manifest["note_path"] = source_pack_value(source_pack, "note_path", "obsidian_note_path")
-    manifest["note_assets_dir"] = source_pack_value(
-        source_pack, "note_assets_dir", "assets_dir_for_note"
+    manifest["note_path"] = source_pack_path_value(source_pack, path, "note_path", "obsidian_note_path")
+    manifest["note_assets_dir"] = source_pack_path_value(
+        source_pack, path, "note_assets_dir", "assets_dir_for_note"
     )
     manifest.setdefault("source", {})["source_pack_path"] = str(path)
 
@@ -1591,14 +1597,14 @@ def main() -> int:
         source_pack_path = Path(args.source_pack).expanduser().resolve()
         source_pack = read_json(source_pack_path)
 
-    content_list_arg = args.content_list or source_pack_value(
-        source_pack, "content_list", "content_list_path", "content_list_json"
+    content_list_arg = args.content_list or source_pack_path_value(
+        source_pack, source_pack_path, "content_list", "content_list_path", "content_list_json"
     )
-    assets_arg = args.assets_dir or source_pack_value(
-        source_pack, "assets_dir", "assets_source_dir", "parser_assets_dir"
+    assets_arg = args.assets_dir or source_pack_path_value(
+        source_pack, source_pack_path, "assets_dir", "assets_source_dir", "parser_assets_dir"
     )
-    full_md_arg = args.full_md or source_pack_value(
-        source_pack, "source_md", "full_md_path", "full_md"
+    full_md_arg = args.full_md or source_pack_path_value(
+        source_pack, source_pack_path, "source_md", "full_md_path", "full_md"
     )
     if not content_list_arg:
         raise SystemExit("content_list is required unless --source-pack provides it")
