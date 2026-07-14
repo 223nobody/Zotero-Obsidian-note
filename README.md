@@ -2,7 +2,7 @@
 `zotero-group-meeting-note` 是一个面向 Codex 的中文研究生组会文献汇报 skill。它用于从 Zotero 当前论文、PDF、本地 MinerU 解析结果、`paper-search-mcp` 解析缓存、已有 Zotero/Obsidian 笔记或抽取后的 Markdown 中，生成可直接用于组会分享的深度中文笔记，并保存到 Obsidian 的 `组会分享/<日期>/` 目录。
 
 <p align="center">
-  <img src="zotero-group-meeting-note/docs/images/首屏总览图.png" alt="从论文检索、MinerU 解析、证据构建到 Obsidian 组会笔记交付的完整流程总览" width="100%">
+  <img src="docs/images/首屏总览图.png" alt="从论文检索、MinerU 解析、证据构建到 Obsidian 组会笔记交付的完整流程总览" width="100%">
 </p>
 
 总览图展示了从论文入口、`paper-search-mcp` 检索下载、MinerU 结构化解析，到证据构建、组会笔记生成和 Validation Gates 的完整主链路。
@@ -27,7 +27,7 @@
 这套工作流中的工具各自承担不同职责：`paper-search-mcp` 负责检索、选择、下载和解析，Zotero 负责文献管理与阅读上下文，本仓库的 skill 负责证据绑定、解释、写作和验证，Obsidian 负责保存最终笔记、图片资产与人工评论。
 
 <p align="center">
-  <img src="zotero-group-meeting-note/docs/images/生态协作图.png" alt="Zotero、paper-search-mcp、zotero-group-meeting-note、Obsidian 与研究者之间的协作生态" width="100%">
+  <img src="docs/images/生态协作图.png" alt="Zotero、paper-search-mcp、zotero-group-meeting-note、Obsidian 与研究者之间的协作生态" width="100%">
 </p>
 
 图中的实线表示确定的数据流，虚线表示可选或由研究者触发的操作。下载后的 PDF 可以选择导入 Zotero，Obsidian 中的人工评论也可以用于后续完善，但这些路径不代表后台自动双向同步。
@@ -194,7 +194,7 @@ copy map 的价值：
 证据绑定以论文中的 Figure、Table、Equation 等语义对象为中心：`content_list.json` 提供原文顺序和资源线索，evidence manifest 记录匹配关系与置信度，copy map 再把源资产映射为稳定的 Obsidian 本地链接。相同 SHA256 的图片只保留一份物理文件，但可以保留多条证据绑定。
 
 <p align="center">
-  <img src="zotero-group-meeting-note/docs/images/证据绑定示意图.png" alt="从论文对象、MinerU 源证据、evidence manifest、copy map 到 Obsidian 最终章节的证据绑定过程" width="100%">
+  <img src="docs/images/证据绑定示意图.png" alt="从论文对象、MinerU 源证据、evidence manifest、copy map 到 Obsidian 最终章节的证据绑定过程" width="100%">
 </p>
 
 主论文证据进入 `## 五、图表公式解释`，Appendix 或 References 后的实质内容进入 `## 八、参考文献后内容与补充材料`；无法可靠匹配的资产只进入外部审计，不会被强行塞入笔记正文。
