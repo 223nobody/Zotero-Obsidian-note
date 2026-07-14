@@ -1,6 +1,12 @@
 <h1 align="center">Zotero-Obsidian-Note</h1>
 `zotero-group-meeting-note` 是一个面向 Codex 的中文研究生组会文献汇报 skill。它用于从 Zotero 当前论文、PDF、本地 MinerU 解析结果、`paper-search-mcp` 解析缓存、已有 Zotero/Obsidian 笔记或抽取后的 Markdown 中，生成可直接用于组会分享的深度中文笔记，并保存到 Obsidian 的 `组会分享/<日期>/` 目录。
 
+<p align="center">
+  <img src="zotero-group-meeting-note/docs/images/首屏总览图.png" alt="从论文检索、MinerU 解析、证据构建到 Obsidian 组会笔记交付的完整流程总览" width="100%">
+</p>
+
+总览图展示了从论文入口、`paper-search-mcp` 检索下载、MinerU 结构化解析，到证据构建、组会笔记生成和 Validation Gates 的完整主链路。
+
 ### **推荐和 <a href="https://github.com/223nobody/paper-search-mcp" style="color:#31B0F2;text-decoration:underline;text-decoration-color:#31B0F2;">223nobody/paper-search-mcp</a> 一起使用**
 
 `paper-search-mcp` 负责论文检索、下载、MinerU 解析和结构化缓存，本仓库的 skill 负责把解析后的正文、图表、公式和资产组织成 Obsidian 组会分享笔记。
@@ -15,6 +21,16 @@
 - 参考文献后的 Appendix / Supplementary / Prompt / Case Study 等内容应该如何单独处理。
 
 当前 skill 是对 Zotero + Obsidian + MinerU / `paper-search-mcp` 论文工作流的尝试，欢迎按自己的阅读和组会习惯继续改造。
+
+## 协作生态
+
+这套工作流中的工具各自承担不同职责：`paper-search-mcp` 负责检索、选择、下载和解析，Zotero 负责文献管理与阅读上下文，本仓库的 skill 负责证据绑定、解释、写作和验证，Obsidian 负责保存最终笔记、图片资产与人工评论。
+
+<p align="center">
+  <img src="zotero-group-meeting-note/docs/images/生态协作图.png" alt="Zotero、paper-search-mcp、zotero-group-meeting-note、Obsidian 与研究者之间的协作生态" width="100%">
+</p>
+
+图中的实线表示确定的数据流，虚线表示可选或由研究者触发的操作。下载后的 PDF 可以选择导入 Zotero，Obsidian 中的人工评论也可以用于后续完善，但这些路径不代表后台自动双向同步。
 
 ## 推荐调用方式
 
@@ -173,6 +189,16 @@ copy map 的价值：
 - 记录 source/destination 路径和 SHA256。
 - 让 `validate_note.py` 能用 destination/hash 做严格校验，避免同 basename 图片误匹配。
 
+#### 证据绑定示意
+
+证据绑定以论文中的 Figure、Table、Equation 等语义对象为中心：`content_list.json` 提供原文顺序和资源线索，evidence manifest 记录匹配关系与置信度，copy map 再把源资产映射为稳定的 Obsidian 本地链接。相同 SHA256 的图片只保留一份物理文件，但可以保留多条证据绑定。
+
+<p align="center">
+  <img src="zotero-group-meeting-note/docs/images/证据绑定示意图.png" alt="从论文对象、MinerU 源证据、evidence manifest、copy map 到 Obsidian 最终章节的证据绑定过程" width="100%">
+</p>
+
+主论文证据进入 `## 五、图表公式解释`，Appendix 或 References 后的实质内容进入 `## 八、参考文献后内容与补充材料`；无法可靠匹配的资产只进入外部审计，不会被强行塞入笔记正文。
+
 ### 4. 起草笔记
 
 按 `references/blueprint.md` 起草中文组会笔记。重点是：
@@ -285,11 +311,19 @@ table-table-3.jpg
 | `prepare_output.py` | 创建 Obsidian 输出目录、笔记占位文件、复制已匹配资产、写出 copy map |
 | `validate_note.py` | 检查笔记结构、图片链接、禁用的 MinerU 资源索引和证据图片放置 |
 | `audit_note_assets.py` | 生成资产审计 JSON，辅助发现未引用或重复图片 |
+| `audit_note_quality.py` | 审计笔记内容深度（数学格式、公式深度、证据叙事、占位符残留），输出修复决策 |
+| `audit_unmatched_assets.py` | 对比 MinerU 源资产与最终笔记资产，分类未匹配文件 |
 | `collect_assets.py` | 从 Markdown / Obsidian wiki embed 收集本地图片到 `assets/` |
 | `extract_source_order.py` | 从 Markdown / text 初步抽取 Figure / Table / Equation 原文顺序 |
 | `extract_terms.py` | 抽取高频英文术语候选，辅助术语翻译一致性 |
 | `batch_note_pipeline.py` | 多论文批处理 deterministic stages，不替代 LLM 写正文 |
+| `build_repair_context.py` | 从 gate 报告合并构建 item-level 修复上下文 |
+| `final_gate_runner.py` | 单论文最终 gate 栈运行器（验证→质量→领域→资产→未匹配资产→交付） |
+| `gate_common.py` | Gate 报告共享工具库（hash、JSON 读写、状态判断） |
 | `update_pipeline_sidecar.py` | 手动创建或更新单篇论文 pipeline sidecar |
+| `validate_domain_consistency.py` | 校验笔记 `论文类型` 与源论文标题/摘要的领域一致性 |
+| `validate_evidence_coverage.py` | 对照 evidence manifest 校验最终笔记的证据覆盖率 |
+| `validate_sidecar.py` | 验证并迁移单论文 batch sidecar，检查 gate 完整性和 hash 一致性 |
 | `smoke_test_skill.py` | 维护 skill 后运行的综合 smoke test |
 
 典型单篇论文流程：
@@ -330,9 +364,14 @@ git diff --check
 - `source-order.md`：统一图表公式证据时间线、正文/附录/caption/正文引用区分、详略规则。
 - `mcp-paper-search.md`：与 `paper-search-mcp` / MinerU 解析源包协作的流程。
 - `review-pass.md`：交付前检查、术语一致性、证据缺口、口语化润色。
+- `repair-pass.md`：Gate 未通过时的修复流程、修复范围（item/section/asset/domain/regeneration）和优先级。
 - `output.md`：Obsidian/Zotero 兼容输出路径、文件名、assets、失败模式。
 - `validation.md`：验证命令、严格证据校验、资产审计、维护测试。
 - `terminology.md`：常见技术术语中文译法。
+- `asset-binding.md`：资产绑定状态、SHA256 去重规则、公式截图处理、多面板图像覆盖。
+- `batch-control.md`：`batch-final-controlled` 模式下的批量边界划分、每论文必需产物、sidecar 管理。
+- `error-codes.md`：Quality / Domain / Evidence & Assets 三类错误码定义和报告规则。
+- `subagent-contract.md`：子代理隔离契约（允许/禁止的输入、prompt pack 结构）。
 
 ## 领域模板
 
@@ -361,6 +400,8 @@ git diff --check
     ├── agents/
     │   └── openai.yaml
     ├── references/
+    │   ├── asset-binding.md
+    │   ├── batch-control.md
     │   ├── blueprint.md
     │   ├── domain-cv.md
     │   ├── domain-db.md
@@ -373,23 +414,34 @@ git diff --check
     │   ├── domain-security.md
     │   ├── domain-skill.md
     │   ├── domain-systems.md
+    │   ├── error-codes.md
     │   ├── mcp-paper-search.md
     │   ├── output.md
+    │   ├── repair-pass.md
     │   ├── review-pass.md
     │   ├── source-order.md
+    │   ├── subagent-contract.md
     │   ├── terminology.md
     │   └── validation.md
     └── scripts/
         ├── audit_note_assets.py
+        ├── audit_note_quality.py
+        ├── audit_unmatched_assets.py
         ├── batch_note_pipeline.py
         ├── build_evidence_manifest.py
+        ├── build_repair_context.py
         ├── collect_assets.py
         ├── extract_source_order.py
         ├── extract_terms.py
+        ├── final_gate_runner.py
+        ├── gate_common.py
         ├── prepare_output.py
         ├── smoke_test_skill.py
         ├── update_pipeline_sidecar.py
-        └── validate_note.py
+        ├── validate_domain_consistency.py
+        ├── validate_evidence_coverage.py
+        ├── validate_note.py
+        └── validate_sidecar.py
 ```
 
 ## 输出质量标准
